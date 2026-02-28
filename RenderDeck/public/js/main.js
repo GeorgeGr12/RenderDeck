@@ -15,13 +15,17 @@ import { ModelManager } from './models/ModelManager.js';
 import { UVEditor } from './ui/UVEditor.js';
 import { ControlsManager } from './ui/Controls.js';
 
+// Props & Scenes
+import { PropManager } from './props/PropManager.js';
+import { CustomSceneStorage } from './scenes/CustomSceneStorage.js';
+
 // Utils
 import { log, logError, logSuccess, logWarn } from './utils/logger.js';
 import { TextureCompositor } from './utils/TextureCompositor.js';
 import { centerAndFrameModel, cleanupObject } from './utils/helpers.js';
 
 // Config
-import { CONFIG, MODEL_PATHS } from './config.js';
+import { CONFIG, MODEL_PATHS, PROP_PATHS } from './config.js';
 
 // Scenes
 import { initScenes, loadScene, getSceneNames } from './scenes.js';
@@ -41,11 +45,24 @@ const materialManager = new MaterialManager();
 const modelManager = new ModelManager(log);
 const uvEditor = new UVEditor(rendererManager, log, modelManager, materialManager);
 
+const propManager = new PropManager(
+  sceneManager.getScene(),
+  cameraManager.getCamera(),
+  rendererManager.getRenderer(),
+  cameraManager.getControls(),
+  log
+);
+
+const sceneStorage = new CustomSceneStorage();
+sceneStorage.init();
+
 const objLoader = new OBJLoader();
 const mtlLoader = new MTLLoader();
 
 let activeModel = null;
 let activeMesh = null;
+let currentEnvironment = null;
+let currentBackground = null;
 
 //═══════════════════════════════════════════════════════════════
 // SCENE SETUP
@@ -56,6 +73,8 @@ log('RenderDeck initialized.');
 initScenes((name, texture) => {
   sceneManager.setEnvironment(texture);
   sceneManager.getScene().background = texture;
+  currentEnvironment = name;
+  currentBackground = 'hdr';
   log(`Scene: ${name}`);
 });
 
@@ -796,9 +815,260 @@ function setupPreviewQualityUI() {
   log('Preview quality UI ready.');
 }
 
+function setupPropsUI() {
+  const propsSelect = document.getElementById('props-select');
+  const addPropBtn = document.getElementById('add-prop-btn');
+  const deletePropBtn = document.getElementById('delete-prop-btn');
+  const clearPropsBtn = document.getElementById('clear-props-btn');
+
+  function populatePropsDropdown() {
+    if (!propsSelect) return;
+    propsSelect.innerHTML = '<option value="" disabled selected>--- Select a Prop ---</option>';
+    
+    const props = propManager.getAvailableProps();
+    const categories = {};
+    
+    props.forEach(prop => {
+      if (!categories[prop.category]) categories[prop.category] = [];
+      categories[prop.category].push(prop);
+    });
+    
+    Object.entries(categories).forEach(([category, items]) => {
+      const optgroup = document.createElement('optgroup');
+      optgroup.label = category;
+      items.forEach(prop => {
+        const option = document.createElement('option');
+        option.value = prop.id;
+        option.textContent = prop.name;
+        optgroup.appendChild(option);
+      });
+      propsSelect.appendChild(optgroup);
+    });
+  }
+
+  populatePropsDropdown();
+
+  if (addPropBtn) {
+    addPropBtn.addEventListener('click', async () => {
+      const propId = propsSelect?.value;
+      if (!propId) {
+        log('Select a prop first', true);
+        return;
+      }
+      // Spawn at the camera's look-at target so the prop appears
+      // in the center of the viewport (where the main model is)
+      const target = cameraManager.getControls().target;
+      await propManager.addProp(propId, { x: target.x, y: target.y, z: target.z });
+      propsSelect.value = '';
+    });
+  }
+
+  if (deletePropBtn) {
+    deletePropBtn.addEventListener('click', () => {
+      if (propManager.selectedProp) {
+        propManager.removeProp(propManager.selectedProp.id);
+      } else {
+        log('No prop selected', true);
+      }
+    });
+  }
+
+  if (clearPropsBtn) {
+    clearPropsBtn.addEventListener('click', () => {
+      if (confirm('Clear all props from scene?')) {
+        propManager.clearAllProps();
+      }
+    });
+  }
+
+  log('Props UI ready.');
+}
+
+function setupSceneSetupUI() {
+  const sceneSelect = document.getElementById('scene-select');
+  const saveSceneBtn = document.getElementById('save-scene-btn');
+  const exportSceneBtn = document.getElementById('export-scene-btn');
+  const importSceneBtn = document.getElementById('import-scene-btn');
+  const sceneFileInput = document.getElementById('scene-file-input');
+
+  async function populateScenesDropdown() {
+    if (!sceneSelect) return;
+    sceneSelect.innerHTML = '<option value="" disabled selected>--- Select a Scene ---</option>';
+    
+    const customScenes = await sceneStorage.getAllSceneNames();
+    
+    if (customScenes.length > 0) {
+      const optgroup = document.createElement('optgroup');
+      optgroup.label = 'Custom Scenes';
+      customScenes.forEach(name => {
+        const option = document.createElement('option');
+        option.value = `custom:${name}`;
+        option.textContent = name;
+        optgroup.appendChild(option);
+      });
+      sceneSelect.appendChild(optgroup);
+    }
+  }
+
+  populateScenesDropdown();
+
+  if (sceneSelect) {
+    sceneSelect.addEventListener('change', async (e) => {
+      const value = e.target.value;
+      if (value.startsWith('custom:')) {
+        const name = value.replace('custom:', '');
+        const sceneData = await sceneStorage.getScene(name);
+        if (sceneData) {
+          await loadSceneSetup(sceneData);
+          log(`Loaded scene: ${name}`);
+        }
+      }
+    });
+  }
+
+  if (saveSceneBtn) {
+    saveSceneBtn.addEventListener('click', async () => {
+      const name = prompt('Enter scene name:');
+      if (!name) return;
+      
+      const controls = cameraManager.getControls();
+      const sceneData = {
+        environment: {
+          hdr: currentEnvironment,
+          background: currentBackground
+        },
+        props: propManager.getSceneData(),
+        camera: {
+          position: {
+            x: cameraManager.getCamera().position.x,
+            y: cameraManager.getCamera().position.y,
+            z: cameraManager.getCamera().position.z
+          },
+          target: {
+            x: controls.target.x,
+            y: controls.target.y,
+            z: controls.target.z
+          }
+        }
+      };
+      
+      await sceneStorage.saveScene(name, sceneData);
+      await populateScenesDropdown();
+      log(`Scene saved: ${name}`);
+    });
+  }
+
+  if (exportSceneBtn) {
+    exportSceneBtn.addEventListener('click', async () => {
+      const value = sceneSelect?.value;
+      if (!value || !value.startsWith('custom:')) {
+        log('Select a custom scene to export', true);
+        return;
+      }
+      const name = value.replace('custom:', '');
+      await sceneStorage.exportScene(name);
+      log(`Scene exported: ${name}`);
+    });
+  }
+
+  if (importSceneBtn && sceneFileInput) {
+    importSceneBtn.addEventListener('click', () => sceneFileInput.click());
+    sceneFileInput.addEventListener('change', async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      try {
+        const result = await sceneStorage.importScene(file);
+        if (result.success) {
+          await populateScenesDropdown();
+          log(`Scene imported: ${result.name}`);
+        }
+      } catch (err) {
+        logError(`Import failed: ${err.message}`);
+      }
+      sceneFileInput.value = '';
+    });
+  }
+
+  const clearScenesBtn = document.getElementById('clear-scenes-btn');
+  if (clearScenesBtn) {
+    clearScenesBtn.addEventListener('click', async () => {
+      if (!confirm('Delete all custom scenes? This cannot be undone!')) return;
+      const names = await sceneStorage.getAllSceneNames();
+      await sceneStorage.clearAllScenes();
+      await populateScenesDropdown();
+      logSuccess(`Cleared ${names.length} custom scene(s)`);
+    });
+  }
+
+  log('Scene setup UI ready.');
+}
+
+async function loadSceneSetup(sceneData) {
+  if (sceneData.environment?.hdr) {
+    loadScene(sceneData.environment.hdr);
+  }
+  if (sceneData.props) {
+    await propManager.loadSceneData(sceneData.props);
+  }
+  if (sceneData.camera) {
+    cameraManager.getCamera().position.set(
+      sceneData.camera.position.x,
+      sceneData.camera.position.y,
+      sceneData.camera.position.z
+    );
+    const controls = cameraManager.getControls();
+    controls.target.set(
+      sceneData.camera.target.x,
+      sceneData.camera.target.y,
+      sceneData.camera.target.z
+    );
+    controls.update();
+  }
+}
+
 //═══════════════════════════════════════════════════════════════
-// ANIMATION LOOP
+// TRANSFORM TOOLBAR (viewport top-left)
 //═══════════════════════════════════════════════════════════════
+
+function setupTransformToolbar() {
+  const btnTranslate = document.getElementById('tf-translate');
+  const btnRotate    = document.getElementById('tf-rotate');
+  const btnScale     = document.getElementById('tf-scale');
+  const btnSnap      = document.getElementById('tf-snap');
+
+  const modeBtns = [btnTranslate, btnRotate, btnScale];
+
+  function activateMode(mode, btn) {
+    modeBtns.forEach(b => b?.classList.remove('tf-btn--active'));
+    btn?.classList.add('tf-btn--active');
+    propManager.setTransformMode(mode);
+  }
+
+  btnTranslate?.addEventListener('click', () => activateMode('translate', btnTranslate));
+  btnRotate?.addEventListener('click',    () => activateMode('rotate',    btnRotate));
+  btnScale?.addEventListener('click',     () => activateMode('scale',     btnScale));
+
+  // Snap toggle
+  let snapOn = false;
+  btnSnap?.addEventListener('click', () => {
+    snapOn = !snapOn;
+    propManager.setSnapEnabled(snapOn);
+    btnSnap.classList.toggle('tf-btn--active', snapOn);
+    log(`Snap: ${snapOn ? 'on' : 'off'}`);
+  });
+
+  // Keep toolbar in sync with keyboard shortcuts (G / R / S)
+  window.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    switch (e.key.toLowerCase()) {
+      case 'g': activateMode('translate', btnTranslate); break;
+      case 'r': activateMode('rotate',    btnRotate);    break;
+      case 's':
+        if (!e.ctrlKey && !e.metaKey) activateMode('scale', btnScale);
+        break;
+    }
+  });
+}
 
 function animate() {
   requestAnimationFrame(animate);
@@ -807,18 +1077,16 @@ function animate() {
 }
 animate();
 
-//═══════════════════════════════════════════════════════════════
-// INITIAL SETUP
-//═══════════════════════════════════════════════════════════════
-
 updateModelList();
 updateSceneList();
 updateMaterialPresetList();
 setupCameraUI();
 setupPostFXUI();
 setupPreviewQualityUI();
+setupPropsUI();
+setupSceneSetupUI();
+setupTransformToolbar();
 
-// Apply initial renderer tone mapping
 rendererManager.getRenderer().toneMapping = THREE.ACESFilmicToneMapping;
 rendererManager.getRenderer().toneMappingExposure = 1.0;
 
