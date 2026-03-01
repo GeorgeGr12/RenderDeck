@@ -147,7 +147,8 @@ export class CustomSceneStorage {
           await this.saveScene(data.name, {
             environment: data.environment,
             props: data.props,
-            camera: data.camera
+            camera: data.camera,
+            model: data.model || null
           });
           resolve({ success: true, name: data.name });
         } catch (err) {

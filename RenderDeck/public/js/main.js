@@ -70,9 +70,22 @@ let currentBackground = null;
 
 log('RenderDeck initialized.');
 
-initScenes((name, texture) => {
-  sceneManager.setEnvironment(texture);
-  sceneManager.getScene().background = texture;
+/**
+ * Process a raw HDR equirectangular texture through PMREMGenerator
+ * so Three.js PBR materials get proper filtered environment reflections.
+ * The raw texture is kept as-is for the panoramic background.
+ */
+function createHDREnvironment(rawTexture) {
+  const pmrem = new THREE.PMREMGenerator(rendererManager.getRenderer());
+  const envMap = pmrem.fromEquirectangular(rawTexture).texture;
+  pmrem.dispose();
+  return envMap;
+}
+
+initScenes((name, rawTexture) => {
+  const envMap = createHDREnvironment(rawTexture);
+  sceneManager.setEnvironment(envMap);
+  sceneManager.getScene().background = rawTexture;
   currentEnvironment = name;
   currentBackground = 'hdr';
   log(`Scene: ${name}`);
@@ -94,18 +107,18 @@ function registerBuiltInModels() {
 // MODEL LOADING
 //═══════════════════════════════════════════════════════════════
 
-async function loadModel(name) {
+async function loadModel(name, onLoaded = null) {
   const modelData = await modelManager.getModel(name);
   if (!modelData) { logError(`Model not found: ${name}`); return; }
   cleanupActiveModel();
   if (modelData.type === 'custom') {
-    await loadCustomModel(name, modelData);
+    await loadCustomModel(name, modelData, onLoaded);
   } else {
-    await loadRegularModel(name, modelData);
+    await loadRegularModel(name, modelData, onLoaded);
   }
 }
 
-async function loadCustomModel(name, modelData) {
+async function loadCustomModel(name, modelData, onLoaded = null) {
   log(`Loading custom model: ${name}…`);
   const loadingPaths = await modelManager.getLoadingPaths(modelData.basedOn);
   if (!loadingPaths) { logError(`Base model not found: ${modelData.basedOn}`); return; }
@@ -143,6 +156,7 @@ async function loadCustomModel(name, modelData) {
 
     sceneManager.add(object);
     activeModel = object;
+    propManager.setMainModel(object);
     centerAndFrameModel(object, cameraManager);
     if (activeMesh?.material) controls.syncMaterialUI(activeMesh.material);
     log(`${name} loaded.`);
@@ -150,12 +164,13 @@ async function loadCustomModel(name, modelData) {
     if (activeMesh) {
       uvEditor.open(activeMesh, name, modelData.materialPreset || 'Wood');
     }
+    if (onLoaded) onLoaded(object);
   },
   (xhr) => { if (xhr.lengthComputable && xhr.total > 0) log(`Loading… ${((xhr.loaded/xhr.total)*100).toFixed(0)}%`); },
   (err) => logError(`OBJ load failed: ${err}`));
 }
 
-async function loadRegularModel(name, modelData) {
+async function loadRegularModel(name, modelData, onLoaded = null) {
   log(`Loading ${name}…`);
   const loadingPaths = await modelManager.getLoadingPaths(name);
   if (!loadingPaths) { logError(`No paths for ${name}`); return; }
@@ -174,6 +189,7 @@ async function loadRegularModel(name, modelData) {
       });
       sceneManager.add(object);
       activeModel = object;
+      propManager.setMainModel(object);
       centerAndFrameModel(object, cameraManager);
       applyMaterialPreset('Wood');
       log(`${name} loaded.`);
@@ -181,6 +197,7 @@ async function loadRegularModel(name, modelData) {
       if (activeMesh) {
         uvEditor.open(activeMesh, name, 'Wood');
       }
+      if (onLoaded) onLoaded(object);
     },
     (xhr) => { if (xhr.lengthComputable && xhr.total > 0) log(`Loading… ${((xhr.loaded/xhr.total)*100).toFixed(0)}%`); },
     (err) => logError(`OBJ load failed: ${err}`));
@@ -207,6 +224,7 @@ async function loadRegularModel(name, modelData) {
 
 function cleanupActiveModel() {
   if (activeModel) {
+    propManager.setMainModel(null);
     sceneManager.remove(activeModel);
     cleanupObject(activeModel);
     activeModel = null;
@@ -428,14 +446,15 @@ const controls = new ControlsManager({
   onMaterialChange: (preset) => applyMaterialPreset(preset),
 
   onSceneChange: (sceneName) => {
-    loadScene(sceneName, (name, texture) => {
-      sceneManager.setEnvironment(texture);
-      sceneManager.getScene().background = texture;
+    loadScene(sceneName, (name, rawTexture) => {
+      const envMap = createHDREnvironment(rawTexture);
+      sceneManager.setEnvironment(envMap);
+      sceneManager.getScene().background = rawTexture;
       log(`Scene: ${name}`);
       if (activeModel) {
         activeModel.traverse((child) => {
           if (child.isMesh && child.material) {
-            child.material.envMap = texture;
+            child.material.envMap = envMap;
             child.material.needsUpdate = true;
           }
         });
@@ -744,6 +763,42 @@ function setupPreviewQualityUI() {
     });
   }
 
+  // ── Resolution ──
+  const resolutionSelect = document.getElementById('resolution-select');
+  if (resolutionSelect) {
+    resolutionSelect.addEventListener('change', (e) => {
+      const [w, h] = e.target.value.split('x').map(Number);
+      if (w && h) {
+        // Change the WebGL render buffer to exactly the chosen resolution.
+        // Use pixelRatio=1 so the buffer isn't multiplied by devicePixelRatio —
+        // otherwise 4K becomes 7680×4320 on Retina and looks WORSE after
+        // the browser crushes it back down to the CSS display size.
+        renderer.setPixelRatio(1);
+        renderer.setSize(w, h, false);
+
+        // Keep camera aspect in sync
+        const cam = cameraManager.getCamera();
+        cam.aspect = w / h;
+        cam.updateProjectionMatrix();
+
+        // Resize EffectComposer buffers
+        if (rendererManager.composer) rendererManager.composer.setSize(w, h);
+
+        // Override CSS !important so the canvas actually shows at the chosen
+        // resolution (fit-to-container, preserving aspect ratio).
+        // This beats the stylesheet's !important via an inline !important.
+        const canvas = renderer.domElement;
+        const cW = rendererManager.container.clientWidth  || 800;
+        const cH = rendererManager.container.clientHeight || 450;
+        const scale = Math.min(cW / w, cH / h, 1);
+        canvas.style.setProperty('width',  Math.round(w * scale) + 'px', 'important');
+        canvas.style.setProperty('height', Math.round(h * scale) + 'px', 'important');
+
+        log(`Resolution: ${w} × ${h}`);
+      }
+    });
+  }
+
   // ── Render Scale ──
   const renderScaleSelect = document.getElementById('render-scale-select');
   if (renderScaleSelect) {
@@ -949,7 +1004,13 @@ function setupSceneSetupUI() {
             y: controls.target.y,
             z: controls.target.z
           }
-        }
+        },
+        model: activeModel ? {
+          name:     getCurrentModelName(),
+          position: { x: activeModel.position.x, y: activeModel.position.y, z: activeModel.position.z },
+          rotation: { x: activeModel.rotation.x, y: activeModel.rotation.y, z: activeModel.rotation.z },
+          scale:    { x: activeModel.scale.x,    y: activeModel.scale.y,    z: activeModel.scale.z }
+        } : null
       };
       
       await sceneStorage.saveScene(name, sceneData);
@@ -1005,24 +1066,60 @@ function setupSceneSetupUI() {
 
 async function loadSceneSetup(sceneData) {
   if (sceneData.environment?.hdr) {
-    loadScene(sceneData.environment.hdr);
+    loadScene(sceneData.environment.hdr, (_name, rawTexture) => {
+      const envMap = createHDREnvironment(rawTexture);
+      sceneManager.setEnvironment(envMap);
+      sceneManager.getScene().background = rawTexture;
+    });
   }
   if (sceneData.props) {
     await propManager.loadSceneData(sceneData.props);
   }
-  if (sceneData.camera) {
+
+  // Camera restore must happen AFTER loadModel finishes, because loadModel calls
+  // centerAndFrameModel() which resets the camera. Calling it here first would
+  // get overwritten. Instead we use a helper and call it inside the onLoaded callback.
+  function restoreCamera() {
+    if (!sceneData.camera) return;
     cameraManager.getCamera().position.set(
       sceneData.camera.position.x,
       sceneData.camera.position.y,
       sceneData.camera.position.z
     );
-    const controls = cameraManager.getControls();
-    controls.target.set(
+    const orbitControls = cameraManager.getControls();
+    orbitControls.target.set(
       sceneData.camera.target.x,
       sceneData.camera.target.y,
       sceneData.camera.target.z
     );
-    controls.update();
+    orbitControls.update();
+  }
+
+  if (sceneData.model?.name) {
+    // Sync the model dropdown so the UI reflects the saved model
+    const modelSel = document.getElementById('object-select') || document.getElementById('model-select');
+    if (modelSel) modelSel.value = sceneData.model.name;
+
+    // Load the saved model; once it finishes, restore transform then camera
+    // (camera must come after centerAndFrameModel so it isn't overwritten)
+    loadModel(sceneData.model.name, () => {
+      if (activeModel) {
+        const m = sceneData.model;
+        activeModel.position.set(m.position.x, m.position.y, m.position.z);
+        activeModel.rotation.set(m.rotation.x, m.rotation.y, m.rotation.z);
+        activeModel.scale.set(m.scale.x, m.scale.y, m.scale.z);
+      }
+      restoreCamera();
+    });
+  } else if (sceneData.model && activeModel) {
+    // Legacy saves (no model name stored) — just restore transform on current model
+    const m = sceneData.model;
+    activeModel.position.set(m.position.x, m.position.y, m.position.z);
+    activeModel.rotation.set(m.rotation.x, m.rotation.y, m.rotation.z);
+    activeModel.scale.set(m.scale.x, m.scale.y, m.scale.z);
+    restoreCamera();
+  } else {
+    restoreCamera();
   }
 }
 
@@ -1073,6 +1170,7 @@ function setupTransformToolbar() {
 function animate() {
   requestAnimationFrame(animate);
   cameraManager.update();
+  propManager.updateOutlines();
   rendererManager.render(sceneManager.getScene(), cameraManager.getCamera());
 }
 animate();

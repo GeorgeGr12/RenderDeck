@@ -3,6 +3,9 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
+import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { PROP_PATHS } from '../config.js';
 
 export class PropManager {
@@ -24,6 +27,8 @@ export class PropManager {
     this.raycaster = new THREE.Raycaster();
     this.mouse = new THREE.Vector2();
     this.customProps = new Map();
+    this.mainModel = null;
+    this._mainModelHelper = null;
     
     this._setupTransformControls();
     this._setupEventListeners();
@@ -83,11 +88,26 @@ export class PropManager {
     });
     
     const intersects = this.raycaster.intersectObjects(allMeshes, false);
-    
+
     if (intersects.length > 0) {
-      const hitMesh = intersects[0].object;
-      const prop = this._findPropByMesh(hitMesh);
-      if (prop) this.selectProp(prop.id);
+      // Hit a prop
+      const prop = this._findPropByMesh(intersects[0].object);
+      if (prop) {
+        this._deselectMainModel();
+        this.selectProp(prop.id);
+      }
+    } else if (this.mainModel) {
+      // Check main model
+      const mainMeshes = [];
+      this.mainModel.traverse(c => { if (c.isMesh) mainMeshes.push(c); });
+      const mainHit = this.raycaster.intersectObjects(mainMeshes, false);
+      if (mainHit.length > 0) {
+        this.deselectProp();
+        this._selectMainModel();
+      } else {
+        this.deselectProp();
+        this._deselectMainModel();
+      }
     } else {
       this.deselectProp();
     }
@@ -274,20 +294,45 @@ export class PropManager {
     }
   }
 
+  setMainModel(object) {
+    this._deselectMainModel();
+    this.mainModel = object;
+  }
+
+  _selectMainModel() {
+    if (!this.mainModel) return;
+    if (this._mainModelHelper) {
+      this.scene.remove(this._mainModelHelper);
+      this._disposeThickOutline(this._mainModelHelper);
+      this._mainModelHelper = null;
+    }
+    this._mainModelHelper = this._createThickOutline(this.mainModel, 0x00d4ff); // cyan-white
+    this.scene.add(this._mainModelHelper);
+    this.transformControls.attach(this.mainModel);
+    this.log('Selected: Main Model');
+  }
+
+  _deselectMainModel() {
+    if (this._mainModelHelper) {
+      this.scene.remove(this._mainModelHelper);
+      this._disposeThickOutline(this._mainModelHelper);
+      this._mainModelHelper = null;
+    }
+    if (this.transformControls?.object === this.mainModel) {
+      this.transformControls.detach();
+    }
+  }
+
   selectProp(propId) {
     const prop = this.props.find(p => p.id === propId);
     if (!prop || prop.locked) return;
 
+    this._deselectMainModel();
     if (this.selectedProp) this._removeOutline(this.selectedProp);
 
     this.selectedProp = prop;
     this._addOutline(prop);
     this.transformControls.attach(prop.object3D);
-
-    // --- DIAGNOSTIC: open F12 > Console to see this ---
-    const wp = new THREE.Vector3();
-    prop.object3D.getWorldPosition(wp);
-    console.log(`[TC] attached to "${prop.displayName}" | world pos: ${wp.x.toFixed(3)}, ${wp.y.toFixed(3)}, ${wp.z.toFixed(3)} | TC visible: ${this.transformControls.visible} | TC in scene: ${this.transformControls.parent !== null}`);
 
     this._updatePropsList();
     this.log(`Selected: ${prop.displayName}`);
@@ -302,18 +347,78 @@ export class PropManager {
     this._updatePropsList();
   }
 
+  // ── Thick-outline helpers (LineSegments2 gives true pixel linewidth) ──
+
+  _boxPositions(object3D) {
+    const box = new THREE.Box3().setFromObject(object3D);
+    const { min: n, max: x } = box;
+    // 12 edges, each as a pair [x1,y1,z1, x2,y2,z2]
+    return [
+      n.x,n.y,n.z, x.x,n.y,n.z,   x.x,n.y,n.z, x.x,n.y,x.z,
+      x.x,n.y,x.z, n.x,n.y,x.z,   n.x,n.y,x.z, n.x,n.y,n.z,
+      n.x,x.y,n.z, x.x,x.y,n.z,   x.x,x.y,n.z, x.x,x.y,x.z,
+      x.x,x.y,x.z, n.x,x.y,x.z,   n.x,x.y,x.z, n.x,x.y,n.z,
+      n.x,n.y,n.z, n.x,x.y,n.z,   x.x,n.y,n.z, x.x,x.y,n.z,
+      x.x,n.y,x.z, x.x,x.y,x.z,   n.x,n.y,x.z, n.x,x.y,x.z,
+    ];
+  }
+
+  /** Return { dw, dh, cw, ch, linewidth } needed for LineMaterial consistency. */
+  _outlineMetrics() {
+    const canvas = this.renderer.domElement;
+    const gl     = this.renderer.getContext();
+    const dw = gl.drawingBufferWidth  || canvas.width  || 800;
+    const dh = gl.drawingBufferHeight || canvas.height || 600;
+    const cw = canvas.clientWidth  || dw;
+    const ch = canvas.clientHeight || dh;
+    // Scale linewidth so the outline always appears ~3 CSS pixels wide
+    // regardless of the render buffer / display size ratio.
+    const linewidth = 3 * (dh / ch);
+    return { dw, dh, cw, ch, linewidth };
+  }
+
+  _createThickOutline(object3D, colorHex) {
+    const { dw, dh, linewidth } = this._outlineMetrics();
+    const geo = new LineSegmentsGeometry();
+    geo.setPositions(this._boxPositions(object3D));
+    const mat = new LineMaterial({ color: colorHex, linewidth, resolution: new THREE.Vector2(dw, dh) });
+    const outline = new LineSegments2(geo, mat);
+    outline.userData.trackedObject = object3D;
+    return outline;
+  }
+
+  _disposeThickOutline(outline) {
+    if (!outline) return;
+    outline.geometry?.dispose();
+    outline.material?.dispose();
+  }
+
+  /** Call every frame from the animate loop to keep outlines tracking moving objects */
+  updateOutlines() {
+    const { dw, dh, linewidth } = this._outlineMetrics();
+    const refresh = (outline) => {
+      if (!outline) return;
+      const obj = outline.userData?.trackedObject;
+      if (!obj) return;
+      outline.geometry.setPositions(this._boxPositions(obj));
+      outline.material.resolution.set(dw, dh);
+      outline.material.linewidth = linewidth;
+    };
+    if (this.selectedProp?._outlineHelper) refresh(this.selectedProp._outlineHelper);
+    if (this._mainModelHelper)             refresh(this._mainModelHelper);
+  }
+
   _addOutline(prop) {
-    const helper = new THREE.BoxHelper(prop.object3D, 0x00ff00);
-    helper.userData.isOutline = true;
-    this.scene.add(helper);
-    prop._outlineHelper = helper;
+    const outline = this._createThickOutline(prop.object3D, 0x39ff14); // neon green
+    outline.userData.isOutline = true;
+    this.scene.add(outline);
+    prop._outlineHelper = outline;
   }
 
   _removeOutline(prop) {
     if (prop._outlineHelper) {
       this.scene.remove(prop._outlineHelper);
-      prop._outlineHelper.geometry.dispose();
-      prop._outlineHelper.material.dispose();
+      this._disposeThickOutline(prop._outlineHelper);
       prop._outlineHelper = null;
     }
   }
