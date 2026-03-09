@@ -3,6 +3,7 @@
 import * as THREE from 'three';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 import { MTLLoader } from 'three/addons/loaders/MTLLoader.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 // Core
 import { SceneManager } from './core/Scene.js';
@@ -14,10 +15,10 @@ import { ModelManager } from './models/ModelManager.js';
 
 import { UVEditor } from './ui/UVEditor.js';
 import { ControlsManager } from './ui/Controls.js';
-
-// Props & Scenes
-import { PropManager } from './props/PropManager.js';
-import { CustomSceneStorage } from './scenes/CustomSceneStorage.js';
+import { SceneStateManager }    from './stateEditor/SceneState.js';
+import { DesignStateManager }   from './stateEditor/DesignState.js';
+import { MaterialStateManager } from './stateEditor/MaterialState.js';
+import * as IDBStorage from './storage/indexedDBStorage.js';
 
 // Utils
 import { log, logError, logSuccess, logWarn } from './utils/logger.js';
@@ -25,10 +26,14 @@ import { TextureCompositor } from './utils/TextureCompositor.js';
 import { centerAndFrameModel, cleanupObject } from './utils/helpers.js';
 
 // Config
-import { CONFIG, MODEL_PATHS, PROP_PATHS } from './config.js';
+import { STANDARD_OBJECTS, STANDARD_MATERIALS, STANDARD_ENVIRONMENTS } from './config.js';
+
+// Props
+import { PropManager } from './props/PropManager.js';
+import { CustomSceneStorage } from './scenes/CustomSceneStorage.js';
 
 // Scenes
-import { initScenes, loadScene, getSceneNames } from './scenes.js';
+import { initScenes, loadScene, getSceneNames } from './core/SceneLoader.js';
 
 //═══════════════════════════════════════════════════════════════
 // INITIALIZATION
@@ -45,6 +50,10 @@ const materialManager = new MaterialManager();
 const modelManager = new ModelManager(log);
 const uvEditor = new UVEditor(rendererManager, log, modelManager, materialManager);
 
+const objLoader = new OBJLoader();
+const mtlLoader = new MTLLoader();
+const gltfLoader = new GLTFLoader();
+
 const propManager = new PropManager(
   sceneManager.getScene(),
   cameraManager.getCamera(),
@@ -53,16 +62,172 @@ const propManager = new PropManager(
   log
 );
 
-const sceneStorage = new CustomSceneStorage();
-sceneStorage.init();
-
-const objLoader = new OBJLoader();
-const mtlLoader = new MTLLoader();
-
 let activeModel = null;
 let activeMesh = null;
-let currentEnvironment = null;
-let currentBackground = null;
+let meshMap = {}; // name → mesh reference for multi‑part models
+
+// Background / environment state
+let currentEnvTexture = null;   // currently loaded HDR texture
+let currentEnvironment = null;  // name of currently loaded HDR (e.g. 'Studio Kominka')
+let showEnvBackground = true;   // scene.background = HDR when true
+let gradientBgEnabled = false;  // show CSS gradient when true
+let currentGradientBg = '';     // key from GRADIENT_PRESETS
+
+const sceneStorage = new CustomSceneStorage();
+
+//═══════════════════════════════════════════════════════════════
+// STATE EDITORS — three independent undo/redo stacks
+//═══════════════════════════════════════════════════════════════
+
+const sceneState = new SceneStateManager({
+  propManager,
+  sceneManager,
+  loadScene,
+  applyBackground: () => applyBackground(),
+  markNeedsRender: (n) => markNeedsRender(n),
+  getEnv: () => ({ currentEnvironment, currentEnvTexture, showEnvBackground, gradientBgEnabled, currentGradientBg }),
+  setEnv: (updates) => {
+    if ('currentEnvironment' in updates) currentEnvironment = updates.currentEnvironment;
+    if ('currentEnvTexture'  in updates) currentEnvTexture  = updates.currentEnvTexture;
+    if ('showEnvBackground'  in updates) showEnvBackground  = updates.showEnvBackground;
+    if ('gradientBgEnabled'  in updates) gradientBgEnabled  = updates.gradientBgEnabled;
+    if ('currentGradientBg'  in updates) currentGradientBg  = updates.currentGradientBg;
+  },
+});
+
+const designState = new DesignStateManager({ uvEditor });
+
+const materialState = new MaterialStateManager({
+  materialManager,
+  getControls:     () => controls,
+  getActiveMesh:   () => activeMesh,
+  markNeedsRender: (n) => markNeedsRender(n),
+});
+
+function pushSceneHistory(label)  { sceneState.push(label); }
+
+function setupHistoryUI() {
+  sceneState.setupUI();
+  designState.setupUI();
+  materialState.setupUI();
+
+  // Save prop transform to scene history when user releases gizmo
+  const modeLabels = { translate: 'Moved prop', rotate: 'Rotated prop', scale: 'Scaled prop' };
+  propManager.onTransformCommit = (mode) => {
+    sceneState.push(modeLabels[mode] || 'Transformed prop');
+  };
+
+  // Unified Ctrl+Z / Ctrl+Shift+Z: undo/redo whichever stack has the most recent entry
+  const managers = [
+    { mgr: sceneState,    restore: (s) => sceneState.restore(s),    ui: () => sceneState.updateUI()    },
+    { mgr: designState,   restore: (s) => designState.restore(s),   ui: () => designState.updateUI()   },
+    { mgr: materialState, restore: (s) => materialState.restore(s), ui: () => materialState.updateUI() },
+  ];
+
+  document.addEventListener('keydown', (e) => {
+    if (!(e.ctrlKey || e.metaKey)) return;
+
+    if (e.key === 'z' && !e.shiftKey) {
+      e.preventDefault();
+      const target = managers.reduce((best, m) =>
+        m.mgr.history.peekUndoTimestamp() > best.mgr.history.peekUndoTimestamp() ? m : best
+      );
+      const state = target.mgr.history.undo();
+      if (state) { target.restore(state); target.ui(); }
+
+    } else if ((e.key === 'z' && e.shiftKey) || e.key === 'y') {
+      e.preventDefault();
+      const target = managers.reduce((best, m) =>
+        m.mgr.history.peekRedoTimestamp() > best.mgr.history.peekRedoTimestamp() ? m : best
+      );
+      const state = target.mgr.history.redo();
+      if (state) { target.restore(state); target.ui(); }
+    }
+  });
+}
+
+const GRADIENT_PRESETS = {
+  grad_studio:  'linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%)',
+  grad_sunset:  'linear-gradient(135deg, #ff6b6b 0%, #feca57 50%, #ff9ff3 100%)',
+  grad_ocean:   'linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%)',
+  grad_forest:  'linear-gradient(135deg, #134e5e 0%, #71b280 100%)',
+  grad_dark:    '#111111',
+  grad_white:   '#f5f5f5',
+  solid_black:  '#000000',
+  solid_white:  '#ffffff',
+  solid_gray:   '#444444',
+};
+
+const SESSION_STORAGE_KEY = 'session:renderdeck.reloadstate.v2';
+const SESSION_BOOT_KEY = 'session:renderdeck.boot.v1';
+
+function applyBackground() {
+  const scene = sceneManager.getScene();
+  // Priority: env background > CSS gradient > plain clear color
+  if (showEnvBackground && currentEnvTexture) {
+    scene.background = currentEnvTexture;
+    container.style.background = '';
+    rendererManager.getRenderer().setClearColor(0x1a1a1a, 1);
+  } else {
+    scene.background = null;
+    if (gradientBgEnabled && currentGradientBg && GRADIENT_PRESETS[currentGradientBg]) {
+      container.style.background = GRADIENT_PRESETS[currentGradientBg];
+      rendererManager.getRenderer().setClearColor(0x000000, 0); // transparent canvas
+    } else {
+      container.style.background = '';
+      rendererManager.getRenderer().setClearColor(0x1a1a1a, 1);
+    }
+  }
+  syncSceneState();
+  markNeedsRender(4);
+}
+
+function syncSceneState() {
+  uvEditor.sceneState = {
+    sceneName: document.getElementById('environment-select')?.value || null,
+    showEnvBackground,
+    gradientBgEnabled,
+    currentGradientBg,
+  };
+}
+
+function restoreSceneState(sceneState) {
+  if (!sceneState) return;
+  if (sceneState.sceneName) {
+    const sel = document.getElementById('environment-select');
+    if (sel) sel.value = sceneState.sceneName;
+    loadScene(sceneState.sceneName, (name, texture) => {
+      currentEnvTexture = texture;
+      currentEnvironment = name;
+      sceneManager.setEnvironment(texture);
+      if (activeModel) {
+        activeModel.traverse((child) => {
+          if (child.isMesh && child.material) {
+            child.material.envMap = texture;
+            child.material.needsUpdate = true;
+          }
+        });
+      }
+      applyBackground();
+      log(`Scene: ${name}`);
+    });
+  }
+  if (typeof sceneState.showEnvBackground === 'boolean') showEnvBackground = sceneState.showEnvBackground;
+  if (typeof sceneState.gradientBgEnabled === 'boolean') gradientBgEnabled = sceneState.gradientBgEnabled;
+  if (typeof sceneState.currentGradientBg === 'string') currentGradientBg = sceneState.currentGradientBg;
+  const envBgToggle = document.getElementById('env-bg-toggle');
+  if (envBgToggle) envBgToggle.checked = showEnvBackground;
+  const gradBgToggle = document.getElementById('gradient-bg-toggle');
+  if (gradBgToggle) gradBgToggle.checked = gradientBgEnabled;
+  const bgSelect = document.getElementById('background-select');
+  if (bgSelect && sceneState.currentGradientBg) bgSelect.value = sceneState.currentGradientBg;
+  applyBackground();
+}
+
+// hover/select helpers
+let hoveredMesh = null;
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
 
 //═══════════════════════════════════════════════════════════════
 // SCENE SETUP
@@ -70,44 +235,43 @@ let currentBackground = null;
 
 log('RenderDeck initialized.');
 
-/**
- * Process a raw HDR equirectangular texture through PMREMGenerator
- * so Three.js PBR materials get proper filtered environment reflections.
- * The raw texture is kept as-is for the panoramic background.
- */
-function createHDREnvironment(rawTexture) {
-  const pmrem = new THREE.PMREMGenerator(rendererManager.getRenderer());
-  const envMap = pmrem.fromEquirectangular(rawTexture).texture;
-  pmrem.dispose();
-  return envMap;
-}
-
-initScenes((name, rawTexture) => {
-  const envMap = createHDREnvironment(rawTexture);
-  sceneManager.setEnvironment(envMap);
-  sceneManager.getScene().background = rawTexture;
+initScenes((name, texture) => {
+  currentEnvTexture = texture;
   currentEnvironment = name;
-  currentBackground = 'hdr';
+  sceneManager.setEnvironment(texture);
+  applyBackground();
   log(`Scene: ${name}`);
 });
 
 registerBuiltInModels();
 
 function registerBuiltInModels() {
-  Object.entries(MODEL_PATHS).forEach(([key, cfg]) => {
-    if (key !== 'BASE_PATH') {
-      const displayName = key.split('_')
-        .map(w => w.charAt(0) + w.slice(1).toLowerCase()).join(' ');
-      modelManager.registerModel(displayName, cfg);
-    }
+  STANDARD_OBJECTS.forEach(obj => {
+    modelManager.registerModel(obj.label, { objPath: obj.objPath, mtlPath: obj.mtlPath });
   });
 }
+
+/** Load JSON material presets from assets, then refresh the UI dropdown. */
+async function initMaterialPresets() {
+  await materialManager.loadPresetsFromManifest(STANDARD_MATERIALS);
+  updateMaterialPresetList();
+}
+initMaterialPresets();
 
 //═══════════════════════════════════════════════════════════════
 // MODEL LOADING
 //═══════════════════════════════════════════════════════════════
 
 async function loadModel(name, onLoaded = null) {
+  // clear any previous part data
+  meshMap = {};
+  clearHighlight();
+  if (controls) {
+    controls.updatePartSelect([]);
+    controls.setEnabled('objectPartSelect', false);
+    controls.setVisible('objectPartSelect', false);
+  }
+
   const modelData = await modelManager.getModel(name);
   if (!modelData) { logError(`Model not found: ${name}`); return; }
   cleanupActiveModel();
@@ -123,15 +287,29 @@ async function loadCustomModel(name, modelData, onLoaded = null) {
   const loadingPaths = await modelManager.getLoadingPaths(modelData.basedOn);
   if (!loadingPaths) { logError(`Base model not found: ${modelData.basedOn}`); return; }
 
-  const objPath = loadingPaths.type === 'path'
-    ? loadingPaths.basePath + loadingPaths.obj : loadingPaths.obj;
+  const objPath = loadingPaths.obj;
 
   objLoader.load(objPath, (object) => {
+    const meshList = [];
+
     object.traverse((child) => {
       if (!child.isMesh) return;
       child.castShadow = true;
       child.receiveShadow = true;
       child.userData.isCustomModel = true;
+
+      // unique naming
+      let baseName = child.name || `Part`;
+      let uniqueName = baseName;
+      let idx = 1;
+      while (meshMap[uniqueName]) {
+        uniqueName = `${baseName}_${idx++}`;
+      }
+      child.name = uniqueName;
+
+      meshList.push(child);
+      meshMap[child.name] = child;
+
       if (!activeMesh) activeMesh = child;
 
       const presetName = modelData.materialPreset || 'Wood';
@@ -143,27 +321,32 @@ async function loadCustomModel(name, modelData, onLoaded = null) {
         materialManager.applySavedProperties(child.material, modelData.materialProperties);
       }
 
-      if (child.material && modelData.overlayImages?.length > 0) {
-        TextureCompositor.createCompositeTexture(child.material.map, modelData.overlayImages)
-          .then(tex => {
-            if (child.material.map) child.material.map.dispose();
-            child.material.map = tex;
-            child.material.needsUpdate = true;
-          })
-          .catch(err => logError(`Composite failed: ${err.message}`));
-      }
+      // Composite texture is applied by uvEditor.open() after it loads the overlays.
     });
 
     sceneManager.add(object);
     activeModel = object;
-    propManager.setMainModel(object);
-    centerAndFrameModel(object, cameraManager);
+    propManager.setMainModel(activeModel);
+    activeMesh = meshList[0] || null;
+    const names = meshList.map(m => m.name);
+    controls.updatePartSelect(names);
+    uvEditor.setPartNames(names, (n) => selectPart(meshMap[n]));
+    const multi = names.length > 1;
+    controls.setEnabled('objectPartSelect', multi);
+    controls.setVisible('objectPartSelect', multi);
+    // frame the new model from a top‑right‑corner angle
+    centerAndFrameModel(object, cameraManager, {mode: 'corner'});
     if (activeMesh?.material) controls.syncMaterialUI(activeMesh.material);
     log(`${name} loaded.`);
     // Initialize UV editor for this custom model
     if (activeMesh) {
       uvEditor.open(activeMesh, name, modelData.materialPreset || 'Wood');
     }
+    // Restore the scene/background that was active when this custom model was saved
+    if (modelData.sceneState) {
+      restoreSceneState(modelData.sceneState);
+    }
+    markNeedsRender(60);
     if (onLoaded) onLoaded(object);
   },
   (xhr) => { if (xhr.lengthComputable && xhr.total > 0) log(`Loading… ${((xhr.loaded/xhr.total)*100).toFixed(0)}%`); },
@@ -175,28 +358,95 @@ async function loadRegularModel(name, modelData, onLoaded = null) {
   const loadingPaths = await modelManager.getLoadingPaths(name);
   if (!loadingPaths) { logError(`No paths for ${name}`); return; }
 
-  function loadOBJ(materials = null) {
-    if (materials) objLoader.setMaterials(materials);
-    const objPath = loadingPaths.type === 'path'
-      ? loadingPaths.basePath + loadingPaths.obj : loadingPaths.obj;
+  // ── GLB/GLTF branch ───────────────────────────────────────────
+  if (loadingPaths.type === 'glb-path' || loadingPaths.type === 'glb-blob') {
+    gltfLoader.load(loadingPaths.obj, (gltf) => {
+      const object = gltf.scene;
+      const meshList = [];
 
-    objLoader.load(objPath, (object) => {
       object.traverse((child) => {
         if (!child.isMesh) return;
         child.castShadow = true;
         child.receiveShadow = true;
-        if (!activeMesh) activeMesh = child;
+        // unique naming
+        let baseName = child.name || `Part`;
+        let uniqueName = baseName;
+        let idx = 1;
+        while (meshMap[uniqueName]) {
+          uniqueName = `${baseName}_${idx++}`;
+        }
+        child.name = uniqueName;
+
+        meshList.push(child);
+        meshMap[child.name] = child;
       });
+      activeMesh = meshList[0] || null;
+      {
+        const names = meshList.map(m => m.name);
+        controls.updatePartSelect(names);
+        uvEditor.setPartNames(names, (n) => selectPart(meshMap[n]));
+        const multi = names.length > 1;
+        controls.setEnabled('objectPartSelect', multi);
+        controls.setVisible('objectPartSelect', multi);
+      }
+
       sceneManager.add(object);
       activeModel = object;
-      propManager.setMainModel(object);
-      centerAndFrameModel(object, cameraManager);
-      applyMaterialPreset('Wood');
+      propManager.setMainModel(activeModel);
+      centerAndFrameModel(object, cameraManager, {mode: 'corner'});
+      log(`${name} loaded.`);
+      if (activeMesh) uvEditor.open(activeMesh, name, 'Wood');
+      markNeedsRender(60);
+      if (onLoaded) onLoaded(object);
+    },
+    (xhr) => { if (xhr.lengthComputable && xhr.total > 0) log(`Loading… ${((xhr.loaded/xhr.total)*100).toFixed(0)}%`); },
+    (err) => logError(`GLB load failed: ${err}`));
+    return;
+  }
+
+  function loadOBJ(materials = null) {
+    if (materials) objLoader.setMaterials(materials);
+    const objPath = loadingPaths.obj;
+
+    objLoader.load(objPath, (object) => {
+      const meshList = [];
+      object.traverse((child) => {
+        if (!child.isMesh) return;
+        child.castShadow = true;
+        child.receiveShadow = true;
+        // unique naming
+        let baseName = child.name || `Part`;
+        let uniqueName = baseName;
+        let idx = 1;
+        while (meshMap[uniqueName]) {
+          uniqueName = `${baseName}_${idx++}`;
+        }
+        child.name = uniqueName;
+
+        meshList.push(child);
+        meshMap[child.name] = child;
+      });
+      activeMesh = meshList[0] || null;
+      {
+        const names = meshList.map(m => m.name);
+        controls.updatePartSelect(names);
+        uvEditor.setPartNames(names, (n) => selectPart(meshMap[n]));
+        const multi = names.length > 1;
+        controls.setEnabled('objectPartSelect', multi);
+        controls.setVisible('objectPartSelect', multi);
+      }
+
+      sceneManager.add(object);
+      activeModel = object;
+      propManager.setMainModel(activeModel);
+      centerAndFrameModel(object, cameraManager, {mode: 'corner'});
+      applyMaterialPreset(materialManager.getPresetNames()[0] || 'Wood');
       log(`${name} loaded.`);
       // Initialize UV editor for this model
       if (activeMesh) {
         uvEditor.open(activeMesh, name, 'Wood');
       }
+      markNeedsRender(60);
       if (onLoaded) onLoaded(object);
     },
     (xhr) => { if (xhr.lengthComputable && xhr.total > 0) log(`Loading… ${((xhr.loaded/xhr.total)*100).toFixed(0)}%`); },
@@ -204,16 +454,17 @@ async function loadRegularModel(name, modelData, onLoaded = null) {
   }
 
   if (loadingPaths.mtl) {
-    const mtlPath = loadingPaths.type === 'path'
-      ? loadingPaths.basePath + loadingPaths.mtl : loadingPaths.mtl;
     if (loadingPaths.type === 'path') {
-      mtlLoader.setPath(loadingPaths.basePath);
-      mtlLoader.load(loadingPaths.mtl,
+      const lastSlash = loadingPaths.mtl.lastIndexOf('/');
+      const mtlBase = loadingPaths.mtl.substring(0, lastSlash + 1);
+      const mtlFile = loadingPaths.mtl.substring(lastSlash + 1);
+      mtlLoader.setPath(mtlBase);
+      mtlLoader.load(mtlFile,
         (m) => { m.preload(); loadOBJ(m); },
         undefined,
         () => loadOBJ());
     } else {
-      fetch(mtlPath).then(r => r.text())
+      fetch(loadingPaths.mtl).then(r => r.text())
         .then(t => { const m = mtlLoader.parse(t, ''); m.preload(); loadOBJ(m); })
         .catch(() => loadOBJ());
     }
@@ -229,6 +480,13 @@ function cleanupActiveModel() {
     cleanupObject(activeModel);
     activeModel = null;
     activeMesh = null;
+    meshMap = {};
+    clearHighlight();
+    if (controls) {
+      controls.updatePartSelect([]);
+      controls.setEnabled('objectPartSelect', false);
+      controls.setVisible('objectPartSelect', false);
+    }
   }
 }
 
@@ -238,30 +496,48 @@ function cleanupActiveModel() {
 
 function applyMaterialPreset(presetName) {
   if (!activeModel) return;
-  activeModel.traverse((child) => {
-    if (!child.isMesh) return;
-    if (child.userData?.isCustomModel) {
-      if (sceneManager.getScene().environment && child.material) {
-        child.material.envMap = sceneManager.getScene().environment;
-        child.material.needsUpdate = true;
+  const env = sceneManager.getScene().environment;
+
+  if (activeMesh) {
+    // change only the selected mesh
+    if (activeMesh.userData?.isCustomModel) {
+      if (env && activeMesh.material) {
+        activeMesh.material.envMap = env;
+        activeMesh.material.needsUpdate = true;
       }
-      return;
+    } else {
+      const material = materialManager.getPreset(presetName);
+      materialManager.applyEnvironment(material, env);
+      if (activeMesh.material) materialManager.dispose(activeMesh.material);
+      activeMesh.material = material;
+      activeMesh.material.needsUpdate = true;
     }
-    const material = materialManager.getPreset(presetName);
-    materialManager.applyEnvironment(material, sceneManager.getScene().environment);
-    if (child.material) materialManager.dispose(child.material);
-    child.material = material;
-    if (!activeMesh) activeMesh = child;
-    child.material.needsUpdate = true;
-  });
+  } else {
+    // fallback: apply to everything
+    activeModel.traverse((child) => {
+      if (!child.isMesh) return;
+      if (child.userData?.isCustomModel) {
+        if (env && child.material) {
+          child.material.envMap = env;
+          child.material.needsUpdate = true;
+        }
+        return;
+      }
+      const material = materialManager.getPreset(presetName);
+      materialManager.applyEnvironment(material, env);
+      if (child.material) materialManager.dispose(child.material);
+      child.material = material;
+      if (!activeMesh) activeMesh = child;
+      child.material.needsUpdate = true;
+    });
+  }
+
   if (activeMesh?.material) controls.syncMaterialUI(activeMesh.material);
   
-  // Update UV editor's base texture to match the new material
-  if (activeMesh?.material?.map) {
-    uvEditor.baseTexture = activeMesh.material.map;
-    uvEditor.currentMaterialPreset = presetName;
-    uvEditor._renderPreview();
-  }
+  // Update UV editor base to match current material (clear stale map if none).
+  uvEditor.baseTexture = activeMesh?.material?.map || null;
+  uvEditor.currentMaterialPreset = presetName;
+  uvEditor._renderPreview();
   
   log(`Preset: ${presetName}`);
 }
@@ -281,6 +557,27 @@ function updateMaterialProperty(property, value) {
 }
 
 //═══════════════════════════════════════════════════════════════
+// BUTTON-ROW HELPER
+//═══════════════════════════════════════════════════════════════
+
+function setupButtonRow(groupId, callback) {
+  const group = document.getElementById(groupId);
+  if (!group) return;
+  group.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-value]');
+    if (!btn) return;
+    group.querySelectorAll('button').forEach(b => b.classList.remove('button-selected'));
+    btn.classList.add('button-selected');
+    const targetId = group.dataset.targetInput;
+    if (targetId) {
+      const input = document.getElementById(targetId);
+      if (input) input.value = btn.dataset.value;
+    }
+    callback(btn.dataset.value);
+  });
+}
+
+//═══════════════════════════════════════════════════════════════
 // CAMERA CONTROLS
 //═══════════════════════════════════════════════════════════════
 
@@ -294,7 +591,7 @@ const SENSOR_SIZES = {
 // State for camera settings
 const camState = {
   type: 'perspective',
-  focalLength: 50,
+  focalLength: 85,    // default lens length changed to 85mm
   sensorKey: 'fullframe',
   near: 0.1,
   far: 2000,
@@ -362,25 +659,40 @@ function setupCameraUI() {
     });
   }
 
-  // Lens / focal length
-  const lensSelect = document.getElementById('lens-mm-select');
-  if (lensSelect) {
-    lensSelect.addEventListener('change', (e) => {
-      camState.focalLength = parseFloat(e.target.value);
-      applyCameraSettings();
-      log(`Lens: ${camState.focalLength}mm`);
-    });
-  }
+  // Lens / focal length — button row preset + slider/input for custom value
+  setupButtonRow('lens-mm-buttons', (v) => {
+    camState.focalLength = parseFloat(v);
+    const s = document.getElementById('lens-mm-slider');
+    const i = document.getElementById('lens-mm-input');
+    if (s) s.value = v;
+    if (i) i.value = v;
+    applyCameraSettings();
+    log(`Lens: ${camState.focalLength}mm`);
+  });
+
+  link('lens-mm-slider', 'lens-mm-input', (v) => {
+    camState.focalLength = v;
+    // Highlight preset button if slider lands on a preset value
+    const group = document.getElementById('lens-mm-buttons');
+    if (group) {
+      group.querySelectorAll('button').forEach(b => {
+        if (parseFloat(b.dataset.value) === v) {
+          b.classList.add('button-selected');
+        } else {
+          b.classList.remove('button-selected');
+        }
+      });
+    }
+    applyCameraSettings();
+    log(`Lens: ${v}mm`);
+  });
 
   // Film / sensor gauge
-  const filmSelect = document.getElementById('film-gauge-select');
-  if (filmSelect) {
-    filmSelect.addEventListener('change', (e) => {
-      camState.sensorKey = e.target.value;
-      applyCameraSettings();
-      log(`Sensor: ${e.target.value}`);
-    });
-  }
+  setupButtonRow('film-gauge-buttons', (v) => {
+    camState.sensorKey = v;
+    applyCameraSettings();
+    log(`Sensor: ${v}`);
+  });
 
   // Near clip
   link('near-slider', 'near-input', (v) => {
@@ -397,13 +709,10 @@ function setupCameraUI() {
   });
 
   // Tone mapping
-  const toneSelect = document.getElementById('tone-mapping-select');
-  if (toneSelect) {
-    toneSelect.addEventListener('change', (e) => {
-      camState.toneMapping = e.target.value;
-      applyCameraSettings();
-    });
-  }
+  setupButtonRow('tone-mapping-buttons', (v) => {
+    camState.toneMapping = v;
+    applyCameraSettings();
+  });
 
   // Exposure
   link('exposure-slider', 'exposure-input', (v) => {
@@ -443,27 +752,44 @@ function setupCameraUI() {
 const controls = new ControlsManager({
   onModelChange: (name) => loadModel(name),
 
+  onPartChange: (partName) => {
+    if (!partName) return;
+    const mesh = meshMap[partName];
+    if (mesh) {
+      activeMesh = mesh;
+      if (activeMesh.material) controls.syncMaterialUI(activeMesh.material);
+      uvEditor.open(activeMesh, getCurrentModelName(), getCurrentMaterialPreset());
+      cameraManager.frameObject(activeMesh, {mode: 'corner'});
+    }
+  },
+
   onMaterialChange: (preset) => applyMaterialPreset(preset),
 
   onSceneChange: (sceneName) => {
-    loadScene(sceneName, (name, rawTexture) => {
-      const envMap = createHDREnvironment(rawTexture);
-      sceneManager.setEnvironment(envMap);
-      sceneManager.getScene().background = rawTexture;
+    loadScene(sceneName, (name, texture) => {
+      currentEnvTexture = texture;
+      currentEnvironment = name;
+      sceneManager.setEnvironment(texture);
+      applyBackground();
       log(`Scene: ${name}`);
       if (activeModel) {
         activeModel.traverse((child) => {
           if (child.isMesh && child.material) {
-            child.material.envMap = envMap;
+            child.material.envMap = texture;
             child.material.needsUpdate = true;
           }
         });
       }
+      pushSceneHistory(`Environment: ${name}`);
     });
   },
 
   onMaterialPropertyChange: (property, value) => {
     updateMaterialProperty(property, value);
+  },
+
+  onMaterialPropertyCommit: () => {
+    materialState.push('Material change');
   },
 
   onApplyDesign: () => {
@@ -518,6 +844,33 @@ const controls = new ControlsManager({
     }
   },
 
+  onChannelTextureUpload: (channel, file) => {
+    if (!activeMesh?.material) { logError('No active mesh'); return; }
+    const url = URL.createObjectURL(file);
+    const loader = new THREE.TextureLoader();
+    loader.load(url, (tex) => {
+      URL.revokeObjectURL(url);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.needsUpdate = true;
+      const old = activeMesh.material[channel];
+      if (old && old.isTexture) old.dispose();
+      activeMesh.material[channel] = tex;
+      activeMesh.material.needsUpdate = true;
+      controls.syncMaterialUI(activeMesh.material);
+      log(`Channel "${channel}" texture set: ${file.name}`);
+    }, undefined, () => logError(`Failed to load texture: ${file.name}`));
+  },
+
+  onChannelTextureClear: (channel) => {
+    if (!activeMesh?.material) return;
+    const old = activeMesh.material[channel];
+    if (old && old.isTexture) old.dispose();
+    activeMesh.material[channel] = null;
+    activeMesh.material.needsUpdate = true;
+    controls.syncMaterialUI(activeMesh.material);
+    log(`Channel "${channel}" texture cleared`);
+  },
+
   onClearCustom: async () => {
     if (!confirm('Clear all custom models? This cannot be undone!')) return;
     const result = await modelManager.clearAllCustomModels();
@@ -530,16 +883,94 @@ const controls = new ControlsManager({
       if (matSelect) matSelect.selectedIndex = 0;
 
       // Load the first built-in model — this applies the Wood default preset
-      const first = Object.keys(MODEL_PATHS).find(k => k !== 'BASE_PATH');
-      if (first) {
-        const name = first.split('_').map(w => w.charAt(0) + w.slice(1).toLowerCase()).join(' ');
-        // loadModel → loadRegularModel → applyMaterialPreset('Wood') → syncMaterialUI
-        // so the UI will fully reset to Wood defaults automatically
-        loadModel(name);
+      if (STANDARD_OBJECTS.length > 0) {
+        loadModel(STANDARD_OBJECTS[0].label);
       }
     }
   },
 });
+
+// start with part selector hidden/disabled until model loaded
+controls.setEnabled('objectPartSelect', false);
+controls.setVisible('objectPartSelect', false);
+
+// --- hover highlighting and click-to-select ---
+const canvas = rendererManager.getDomElement();
+canvas.addEventListener('pointermove', onPointerMove);
+canvas.addEventListener('pointermove', () => markNeedsRender(4), { passive: true });
+canvas.addEventListener('wheel', () => markNeedsRender(8), { passive: true });
+canvas.addEventListener('pointerleave', clearHighlight);
+canvas.addEventListener('click', onCanvasClick);
+canvas.addEventListener('pointerdown', () => markNeedsRender(4));
+
+function setHighlight(mesh) {
+  if (!mesh || mesh === hoveredMesh) return;
+  clearHighlight();
+  hoveredMesh = mesh;
+  // create overlay geometry with orange semi-transparent material on top
+  const overlayGeo = mesh.geometry.clone();
+  const overlayMat = new THREE.MeshBasicMaterial({
+    color: 0xffa500,
+    transparent: true,
+    opacity: 0.3,
+    depthTest: false,
+  });
+  const highlightMesh = new THREE.Mesh(overlayGeo, overlayMat);
+  highlightMesh.name = mesh.name + '_highlight';
+  highlightMesh.renderOrder = 999;
+  mesh.add(highlightMesh);
+  mesh.userData.highlight = highlightMesh;
+}
+
+function clearHighlight() {
+  if (hoveredMesh) {
+    if (hoveredMesh.userData.highlight) {
+      hoveredMesh.remove(hoveredMesh.userData.highlight);
+      hoveredMesh.userData.highlight.geometry.dispose();
+      hoveredMesh.userData.highlight.material.dispose();
+      delete hoveredMesh.userData.highlight;
+    }
+    hoveredMesh = null;
+  }
+}
+
+function onPointerMove(event) {
+  const rect = canvas.getBoundingClientRect();
+  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, cameraManager.getCamera());
+  const intersects = raycaster.intersectObjects(Object.values(meshMap), true);
+  if (intersects.length > 0) {
+    const mesh = intersects[0].object;
+    if (mesh !== activeMesh) {
+      setHighlight(mesh);
+    } else {
+      clearHighlight();
+    }
+  } else {
+    clearHighlight();
+  }
+}
+
+function onCanvasClick() {
+  if (hoveredMesh) {
+    selectPart(hoveredMesh);
+  }
+}
+
+function selectPart(mesh) {
+  if (!mesh) return;
+  clearHighlight();
+  activeMesh = mesh;
+  if (activeMesh.material) controls.syncMaterialUI(activeMesh.material);
+  uvEditor.open(activeMesh, getCurrentModelName(), getCurrentMaterialPreset());
+  cameraManager.frameObject(activeMesh, {mode: 'corner'});
+  const sel = controls.elements.objectPartSelect;
+  if (sel) sel.value = mesh.name;
+  const designSel = document.getElementById('design-part-select');
+  if (designSel) designSel.value = mesh.name;
+}
+
 
 function getCurrentModelName() {
   return document.getElementById('object-select')?.value
@@ -548,6 +979,184 @@ function getCurrentModelName() {
 
 function getCurrentMaterialPreset() {
   return document.getElementById('material-select')?.value || 'Wood';
+}
+
+function waitForModelReady(timeoutMs = 12000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const timer = setInterval(() => {
+      if (activeModel && (activeMesh || Object.keys(meshMap).length > 0)) {
+        clearInterval(timer);
+        resolve();
+        return;
+      }
+      if (Date.now() - start > timeoutMs) {
+        clearInterval(timer);
+        reject(new Error('Timed out waiting for model load'));
+      }
+    }, 100);
+  });
+}
+
+function saveSessionState() {
+  try {
+    const cam = cameraManager.getCamera();
+    const orbit = cameraManager.getControls();
+    const state = {
+      version: 1,
+      savedAt: Date.now(),
+      modelName: getCurrentModelName() || null,
+      partName: activeMesh?.name || null,
+      sceneName: controls?.elements?.sceneSelect?.value || null,
+      materialPreset: getCurrentMaterialPreset() || null,
+      materialProperties: activeMesh?.material
+        ? materialManager.extractProperties(activeMesh.material)
+        : null,
+      showEnvBackground,
+      gradientBgEnabled,
+      currentGradientBg,
+      camState: { ...camState },
+      camera: {
+        position: { x: cam.position.x, y: cam.position.y, z: cam.position.z },
+        target: orbit
+          ? { x: orbit.target.x, y: orbit.target.y, z: orbit.target.z }
+          : null,
+      },
+      uvEditor: uvEditor.getSessionState?.() || null,
+      props: propManager.getSceneData(),
+    };
+    // Fast startup hint (sync read/write, tiny payload)
+    try {
+      localStorage.setItem(SESSION_BOOT_KEY, JSON.stringify({
+        version: 1,
+        savedAt: state.savedAt,
+        modelName: state.modelName,
+        partName: state.partName,
+        sceneName: state.sceneName,
+        materialPreset: state.materialPreset,
+      }));
+    } catch (_) {
+      // ignore localStorage quota/availability failures
+    }
+    // Persist in IndexedDB so larger state (overlay images) survives reload reliably.
+    IDBStorage.put('metadata', SESSION_STORAGE_KEY, state).catch((err) => {
+      console.warn('Session state write failed:', err);
+    });
+  } catch (err) {
+    console.warn('Session save failed:', err);
+  }
+}
+
+async function restoreSessionState() {
+  let state = null;
+  try {
+    state = await IDBStorage.get('metadata', SESSION_STORAGE_KEY);
+    if (!state || state.version !== 1) return false;
+  } catch (err) {
+    console.warn('Session parse failed:', err);
+    return false;
+  }
+
+  try {
+    // Restore scene/environment selection first
+    if (state.sceneName) {
+      const sel = controls?.elements?.sceneSelect;
+      if (sel) sel.value = state.sceneName;
+      loadScene(state.sceneName, (name, texture) => {
+        currentEnvTexture = texture;
+        currentEnvironment = name;
+        sceneManager.setEnvironment(texture);
+        applyBackground();
+        log(`Scene: ${name}`);
+        if (activeModel) {
+          activeModel.traverse((child) => {
+            if (child.isMesh && child.material) {
+              child.material.envMap = texture;
+              child.material.needsUpdate = true;
+            }
+          });
+        }
+      });
+    }
+
+    // Restore background toggles
+    if (typeof state.showEnvBackground === 'boolean') showEnvBackground = state.showEnvBackground;
+    if (typeof state.gradientBgEnabled === 'boolean') gradientBgEnabled = state.gradientBgEnabled;
+    if (typeof state.currentGradientBg === 'string') currentGradientBg = state.currentGradientBg;
+    const envBgToggle = document.getElementById('env-bg-toggle');
+    if (envBgToggle) envBgToggle.checked = showEnvBackground;
+    const gradBgToggle = document.getElementById('gradient-bg-toggle');
+    if (gradBgToggle) gradBgToggle.checked = gradientBgEnabled;
+    const bgSelect = document.getElementById('background-select');
+    if (bgSelect && currentGradientBg) bgSelect.value = currentGradientBg;
+    applyBackground();
+
+    // Restore model
+    const name = state.modelName;
+    if (!name) return false;
+    const modelSel = document.getElementById('object-select') || document.getElementById('model-select');
+    if (modelSel) modelSel.value = name;
+
+    const modelExists = await modelManager.getModel(name);
+    if (!modelExists) return false;
+
+    const activeSelectedName = getCurrentModelName();
+    if (activeSelectedName === name && !activeModel) {
+      try { await waitForModelReady(4000); } catch (_) { /* fall through to explicit load */ }
+    }
+    const modelAlreadyReady = !!(activeModel && (activeMesh || Object.keys(meshMap).length > 0));
+    const isSameModelAlreadyActive = modelAlreadyReady && activeSelectedName === name;
+    if (!isSameModelAlreadyActive) {
+      await loadModel(name);
+      await waitForModelReady();
+    }
+
+    // Restore part selection if available
+    if (state.partName && meshMap[state.partName]) {
+      selectPart(meshMap[state.partName]);
+    }
+
+    // Restore material preset + properties
+    if (state.materialPreset) {
+      const matSel = document.getElementById('material-select');
+      if (matSel) matSel.value = state.materialPreset;
+      applyMaterialPreset(state.materialPreset);
+    }
+    if (state.materialProperties && activeMesh?.material) {
+      materialManager.applySavedProperties(activeMesh.material, state.materialProperties);
+      controls.syncMaterialUI(activeMesh.material);
+    }
+
+    // Restore unsaved design editor overlays
+    if (state.uvEditor) {
+      await uvEditor.restoreSessionState(state.uvEditor);
+    }
+
+    // Restore props
+    if (state.props?.length) {
+      await propManager.loadSceneData(state.props);
+    }
+
+    // Restore camera model/settings last so model framing doesn't override it.
+    if (state.camState && typeof state.camState === 'object') {
+      Object.assign(camState, state.camState);
+      applyCameraSettings();
+    }
+    if (state.camera?.position) {
+      const p = state.camera.position;
+      cameraManager.setPosition(p.x, p.y, p.z);
+    }
+    if (state.camera?.target) {
+      const t = state.camera.target;
+      cameraManager.setTarget(t.x, t.y, t.z);
+    }
+
+    log('Restored previous session.');
+    return true;
+  } catch (err) {
+    console.warn('Session restore failed:', err);
+    return false;
+  }
 }
 
 async function updateModelList() {
@@ -627,16 +1236,6 @@ function setupPostFXUI() {
     rm.setPostFXEnabled(false);
   }
 
-  // ── Preset select ─────────────────────────────────────────────
-  const presetSelect = document.getElementById('postfx-preset-select');
-  if (presetSelect) {
-    presetSelect.addEventListener('change', (e) => {
-      rm.applyPreset(e.target.value);
-      // Also sync the global toggle in Setting 5
-      if (globalToggle) globalToggle.checked = rm.postFXEnabled;
-    });
-  }
-
   // ── Individual effect toggles ─────────────────────────────────
   const bloomToggle = document.getElementById('post-toggle-bloom');
   if (bloomToggle) {
@@ -688,6 +1287,21 @@ let axesHelper = null;
 function setupPreviewQualityUI() {
   const renderer = rendererManager.getRenderer();
   const scene = sceneManager.getScene();
+
+  // ── Resolution select ──
+  const resolutionSelect = document.getElementById('resolution-select');
+  if (resolutionSelect) {
+    resolutionSelect.addEventListener('change', (e) => {
+      const val = e.target.value;
+      if (!val) return;
+      const [w, h] = val.split('x').map(Number);
+      renderer.setSize(w, h);
+      const cam = cameraManager.getCamera();
+      cam.aspect = w / h;
+      cam.updateProjectionMatrix();
+      log(`Resolution: ${w}×${h}`);
+    });
+  }
 
   // ── Shadows toggle ──
   const shadowsToggle = document.getElementById('preview-toggle-shadows');
@@ -763,377 +1377,206 @@ function setupPreviewQualityUI() {
     });
   }
 
-  // ── Resolution ──
-  const resolutionSelect = document.getElementById('resolution-select');
-  if (resolutionSelect) {
-    resolutionSelect.addEventListener('change', (e) => {
-      const [w, h] = e.target.value.split('x').map(Number);
-      if (w && h) {
-        // Change the WebGL render buffer to exactly the chosen resolution.
-        // Use pixelRatio=1 so the buffer isn't multiplied by devicePixelRatio —
-        // otherwise 4K becomes 7680×4320 on Retina and looks WORSE after
-        // the browser crushes it back down to the CSS display size.
-        renderer.setPixelRatio(1);
-        renderer.setSize(w, h, false);
-
-        // Keep camera aspect in sync
-        const cam = cameraManager.getCamera();
-        cam.aspect = w / h;
-        cam.updateProjectionMatrix();
-
-        // Resize EffectComposer buffers
-        if (rendererManager.composer) rendererManager.composer.setSize(w, h);
-
-        // Override CSS !important so the canvas actually shows at the chosen
-        // resolution (fit-to-container, preserving aspect ratio).
-        // This beats the stylesheet's !important via an inline !important.
-        const canvas = renderer.domElement;
-        const cW = rendererManager.container.clientWidth  || 800;
-        const cH = rendererManager.container.clientHeight || 450;
-        const scale = Math.min(cW / w, cH / h, 1);
-        canvas.style.setProperty('width',  Math.round(w * scale) + 'px', 'important');
-        canvas.style.setProperty('height', Math.round(h * scale) + 'px', 'important');
-
-        log(`Resolution: ${w} × ${h}`);
-      }
-    });
-  }
-
   // ── Render Scale ──
-  const renderScaleSelect = document.getElementById('render-scale-select');
-  if (renderScaleSelect) {
-    renderScaleSelect.addEventListener('change', (e) => {
-      const scale = parseFloat(e.target.value);
-      const baseDPR = window.devicePixelRatio || 1;
-      renderer.setPixelRatio(Math.min(baseDPR * scale, 2));
-      log(`Render scale: ${(scale * 100).toFixed(0)}%`);
-    });
-  }
+  setupButtonRow('render-scale-buttons', (v) => {
+    const scale = parseFloat(v);
+    const baseDPR = window.devicePixelRatio || 1;
+    renderer.setPixelRatio(Math.min(baseDPR * scale, 2));
+    log(`Render scale: ${(scale * 100).toFixed(0)}%`);
+  });
 
   // ── Max DPR ──
-  const maxDprSelect = document.getElementById('max-dpr-select');
-  if (maxDprSelect) {
-    maxDprSelect.addEventListener('change', (e) => {
-      const val = e.target.value;
-      if (val === 'auto') {
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-      } else {
-        renderer.setPixelRatio(parseFloat(val));
-      }
-      log(`Max DPR: ${val}`);
-    });
-  }
+  setupButtonRow('max-dpr-buttons', (v) => {
+    if (v === 'auto') {
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    } else {
+      renderer.setPixelRatio(parseFloat(v));
+    }
+    log(`Max DPR: ${v}`);
+  });
 
   // ── Anti-Aliasing mode ──
-  const aaSelect = document.getElementById('aa-mode-select');
-  if (aaSelect) {
-    aaSelect.addEventListener('change', (e) => {
-      const mode = e.target.value;
-      // MSAA is baked into renderer at creation, but we can toggle FXAA
-      if (mode === 'fxaa') {
-        rendererManager.setFXAA(true);
-      } else {
-        rendererManager.setFXAA(false);
-      }
-      log(`Anti-aliasing: ${mode}`);
-    });
-  }
+  setupButtonRow('aa-mode-buttons', (v) => {
+    if (v === 'fxaa') {
+      rendererManager.setFXAA(true);
+    } else {
+      rendererManager.setFXAA(false);
+    }
+    log(`Anti-aliasing: ${v}`);
+  });
 
   // ── Shadow Quality ──
-  const shadowQualitySelect = document.getElementById('shadow-quality-select');
-  if (shadowQualitySelect) {
-    shadowQualitySelect.addEventListener('change', (e) => {
-      const quality = e.target.value;
-      const sizes = { off: 0, low: 512, medium: 1024, high: 2048, ultra: 4096 };
-      const size = sizes[quality] || 2048;
-      
-      if (quality === 'off') {
-        renderer.shadowMap.enabled = false;
-      } else {
-        renderer.shadowMap.enabled = true;
-        // Update shadow map size on lights
-        scene.traverse((obj) => {
-          if (obj.isLight && obj.shadow) {
-            obj.shadow.mapSize.width = size;
-            obj.shadow.mapSize.height = size;
-            if (obj.shadow.map) {
-              obj.shadow.map.dispose();
-              obj.shadow.map = null;
-            }
+  setupButtonRow('shadow-quality-buttons', (v) => {
+    const sizes = { off: 0, low: 512, medium: 1024, high: 2048, ultra: 4096 };
+    const size = sizes[v] || 2048;
+    if (v === 'off') {
+      renderer.shadowMap.enabled = false;
+    } else {
+      renderer.shadowMap.enabled = true;
+      scene.traverse((obj) => {
+        if (obj.isLight && obj.shadow) {
+          obj.shadow.mapSize.width = size;
+          obj.shadow.mapSize.height = size;
+          if (obj.shadow.map) {
+            obj.shadow.map.dispose();
+            obj.shadow.map = null;
           }
-        });
-      }
-      log(`Shadow quality: ${quality}`);
-    });
-  }
+        }
+      });
+    }
+    log(`Shadow quality: ${v}`);
+  });
 
   log('Preview quality UI ready.');
 }
 
+//═══════════════════════════════════════════════════════════════
+// BACKGROUND UI (Setting 1)
+//═══════════════════════════════════════════════════════════════
+
+function setupDesignShortcuts() {
+  const NUDGE    = 2;  // % per keypress
+  const ROT_STEP = 5;  // degrees per keypress
+
+  /** Briefly light up a button to give tactile feedback. */
+  const flash = (id) => {
+    const btn = document.getElementById(id);
+    if (!btn) return;
+    btn.classList.add('sc-active');
+    setTimeout(() => btn.classList.remove('sc-active'), 200);
+  };
+
+  // Keyboard handler — skip when focus is inside a text field
+  document.addEventListener('keydown', (e) => {
+    const tag = e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    switch (e.key) {
+      case 'ArrowUp':    e.preventDefault(); uvEditor.nudgeSelected(0, -NUDGE); flash('sc-up');      break;
+      case 'ArrowDown':  e.preventDefault(); uvEditor.nudgeSelected(0,  NUDGE); flash('sc-down');    break;
+      case 'ArrowLeft':  e.preventDefault(); uvEditor.nudgeSelected(-NUDGE, 0); flash('sc-left');    break;
+      case 'ArrowRight': e.preventDefault(); uvEditor.nudgeSelected( NUDGE, 0); flash('sc-right');   break;
+      case 'q': case 'Q': uvEditor.rotateSelected(-ROT_STEP); flash('sc-rot-ccw'); break;
+      case 'e': case 'E': uvEditor.rotateSelected( ROT_STEP); flash('sc-rot-cw');  break;
+      case 'r': case 'R': uvEditor.resetSelectedTransform();   flash('sc-reset');   break;
+    }
+  });
+
+  // Wire on-screen buttons — same actions + flash
+  const wire = (id, action) => {
+    const btn = document.getElementById(id);
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+      action();
+      btn.classList.add('sc-active');
+      setTimeout(() => btn.classList.remove('sc-active'), 200);
+    });
+  };
+
+  wire('sc-up',      () => uvEditor.nudgeSelected(0, -NUDGE));
+  wire('sc-down',    () => uvEditor.nudgeSelected(0,  NUDGE));
+  wire('sc-left',    () => uvEditor.nudgeSelected(-NUDGE, 0));
+  wire('sc-right',   () => uvEditor.nudgeSelected( NUDGE, 0));
+  wire('sc-rot-ccw', () => uvEditor.rotateSelected(-ROT_STEP));
+  wire('sc-rot-cw',  () => uvEditor.rotateSelected( ROT_STEP));
+  wire('sc-reset',   () => uvEditor.resetSelectedTransform());
+}
+
+function setupBackgroundUI() {
+  // "Show environment background" — if OFF, HDR is still used for lighting but not as bg
+  const envBgToggle = document.getElementById('env-bg-toggle');
+  if (envBgToggle) {
+    showEnvBackground = envBgToggle.checked;
+    envBgToggle.addEventListener('change', e => {
+      showEnvBackground = e.target.checked;
+      applyBackground();
+      pushSceneHistory(showEnvBackground ? 'Background: show env' : 'Background: hide env');
+    });
+  }
+
+  // "Enable gradient background"
+  const gradBgToggle = document.getElementById('gradient-bg-toggle');
+  if (gradBgToggle) {
+    gradientBgEnabled = gradBgToggle.checked;
+    gradBgToggle.addEventListener('change', e => {
+      gradientBgEnabled = e.target.checked;
+      applyBackground();
+      pushSceneHistory(gradientBgEnabled ? 'Background: gradient on' : 'Background: gradient off');
+    });
+  }
+
+  // Gradient preset dropdown (reuses the existing background-select element)
+  const bgSelect = document.getElementById('background-select');
+  if (bgSelect) {
+    bgSelect.addEventListener('change', e => {
+      currentGradientBg = e.target.value;
+      applyBackground();
+      pushSceneHistory(`Background: ${e.target.value || 'none'}`);
+    });
+  }
+}
+
+//═══════════════════════════════════════════════════════════════
+// PROPS UI
+//═══════════════════════════════════════════════════════════════
+
 function setupPropsUI() {
-  const propsSelect = document.getElementById('props-select');
-  const addPropBtn = document.getElementById('add-prop-btn');
+  const propsSelect   = document.getElementById('props-select');
+  const addPropBtn    = document.getElementById('add-prop-btn');
   const deletePropBtn = document.getElementById('delete-prop-btn');
   const clearPropsBtn = document.getElementById('clear-props-btn');
 
-  function populatePropsDropdown() {
-    if (!propsSelect) return;
-    propsSelect.innerHTML = '<option value="" disabled selected>--- Select a Prop ---</option>';
-    
-    const props = propManager.getAvailableProps();
-    const categories = {};
-    
-    props.forEach(prop => {
-      if (!categories[prop.category]) categories[prop.category] = [];
-      categories[prop.category].push(prop);
+  if (!propsSelect) return;
+
+  // Populate dropdown grouped by category
+  propsSelect.innerHTML = '<option value="" disabled selected>--- Select a Prop ---</option>';
+  const categories = {};
+  propManager.getAvailableProps().forEach(prop => {
+    if (!categories[prop.category]) categories[prop.category] = [];
+    categories[prop.category].push(prop);
+  });
+  Object.entries(categories).forEach(([cat, items]) => {
+    const grp = document.createElement('optgroup');
+    grp.label = cat;
+    items.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      opt.textContent = p.name;
+      grp.appendChild(opt);
     });
-    
-    Object.entries(categories).forEach(([category, items]) => {
-      const optgroup = document.createElement('optgroup');
-      optgroup.label = category;
-      items.forEach(prop => {
-        const option = document.createElement('option');
-        option.value = prop.id;
-        option.textContent = prop.name;
-        optgroup.appendChild(option);
-      });
-      propsSelect.appendChild(optgroup);
-    });
-  }
+    propsSelect.appendChild(grp);
+  });
 
-  populatePropsDropdown();
+  addPropBtn?.addEventListener('click', async () => {
+    const propId = propsSelect.value;
+    if (!propId) return;
+    const target = cameraManager.getControls().target;
+    await propManager.addProp(propId, { x: target.x, y: target.y, z: target.z });
+    propsSelect.value = '';
+    pushSceneHistory(`Added prop: ${propId}`);
+  });
 
-  if (addPropBtn) {
-    addPropBtn.addEventListener('click', async () => {
-      const propId = propsSelect?.value;
-      if (!propId) {
-        log('Select a prop first', true);
-        return;
-      }
-      // Spawn at the camera's look-at target so the prop appears
-      // in the center of the viewport (where the main model is)
-      const target = cameraManager.getControls().target;
-      await propManager.addProp(propId, { x: target.x, y: target.y, z: target.z });
-      propsSelect.value = '';
-    });
-  }
-
-  if (deletePropBtn) {
-    deletePropBtn.addEventListener('click', () => {
-      if (propManager.selectedProp) {
-        propManager.removeProp(propManager.selectedProp.id);
-      } else {
-        log('No prop selected', true);
-      }
-    });
-  }
-
-  if (clearPropsBtn) {
-    clearPropsBtn.addEventListener('click', () => {
-      if (confirm('Clear all props from scene?')) {
-        propManager.clearAllProps();
-      }
-    });
-  }
-
-  log('Props UI ready.');
-}
-
-function setupSceneSetupUI() {
-  const sceneSelect = document.getElementById('scene-select');
-  const saveSceneBtn = document.getElementById('save-scene-btn');
-  const exportSceneBtn = document.getElementById('export-scene-btn');
-  const importSceneBtn = document.getElementById('import-scene-btn');
-  const sceneFileInput = document.getElementById('scene-file-input');
-
-  async function populateScenesDropdown() {
-    if (!sceneSelect) return;
-    sceneSelect.innerHTML = '<option value="" disabled selected>--- Select a Scene ---</option>';
-    
-    const customScenes = await sceneStorage.getAllSceneNames();
-    
-    if (customScenes.length > 0) {
-      const optgroup = document.createElement('optgroup');
-      optgroup.label = 'Custom Scenes';
-      customScenes.forEach(name => {
-        const option = document.createElement('option');
-        option.value = `custom:${name}`;
-        option.textContent = name;
-        optgroup.appendChild(option);
-      });
-      sceneSelect.appendChild(optgroup);
+  deletePropBtn?.addEventListener('click', () => {
+    if (propManager.selectedProp) {
+      const id = propManager.selectedProp.id;
+      propManager.removeProp(id);
+      pushSceneHistory(`Removed prop: ${id}`);
     }
-  }
+  });
 
-  populateScenesDropdown();
-
-  if (sceneSelect) {
-    sceneSelect.addEventListener('change', async (e) => {
-      const value = e.target.value;
-      if (value.startsWith('custom:')) {
-        const name = value.replace('custom:', '');
-        const sceneData = await sceneStorage.getScene(name);
-        if (sceneData) {
-          await loadSceneSetup(sceneData);
-          log(`Loaded scene: ${name}`);
-        }
-      }
-    });
-  }
-
-  if (saveSceneBtn) {
-    saveSceneBtn.addEventListener('click', async () => {
-      const name = prompt('Enter scene name:');
-      if (!name) return;
-      
-      const controls = cameraManager.getControls();
-      const sceneData = {
-        environment: {
-          hdr: currentEnvironment,
-          background: currentBackground
-        },
-        props: propManager.getSceneData(),
-        camera: {
-          position: {
-            x: cameraManager.getCamera().position.x,
-            y: cameraManager.getCamera().position.y,
-            z: cameraManager.getCamera().position.z
-          },
-          target: {
-            x: controls.target.x,
-            y: controls.target.y,
-            z: controls.target.z
-          }
-        },
-        model: activeModel ? {
-          name:     getCurrentModelName(),
-          position: { x: activeModel.position.x, y: activeModel.position.y, z: activeModel.position.z },
-          rotation: { x: activeModel.rotation.x, y: activeModel.rotation.y, z: activeModel.rotation.z },
-          scale:    { x: activeModel.scale.x,    y: activeModel.scale.y,    z: activeModel.scale.z }
-        } : null
-      };
-      
-      await sceneStorage.saveScene(name, sceneData);
-      await populateScenesDropdown();
-      log(`Scene saved: ${name}`);
-    });
-  }
-
-  if (exportSceneBtn) {
-    exportSceneBtn.addEventListener('click', async () => {
-      const value = sceneSelect?.value;
-      if (!value || !value.startsWith('custom:')) {
-        log('Select a custom scene to export', true);
-        return;
-      }
-      const name = value.replace('custom:', '');
-      await sceneStorage.exportScene(name);
-      log(`Scene exported: ${name}`);
-    });
-  }
-
-  if (importSceneBtn && sceneFileInput) {
-    importSceneBtn.addEventListener('click', () => sceneFileInput.click());
-    sceneFileInput.addEventListener('change', async (e) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
-      try {
-        const result = await sceneStorage.importScene(file);
-        if (result.success) {
-          await populateScenesDropdown();
-          log(`Scene imported: ${result.name}`);
-        }
-      } catch (err) {
-        logError(`Import failed: ${err.message}`);
-      }
-      sceneFileInput.value = '';
-    });
-  }
-
-  const clearScenesBtn = document.getElementById('clear-scenes-btn');
-  if (clearScenesBtn) {
-    clearScenesBtn.addEventListener('click', async () => {
-      if (!confirm('Delete all custom scenes? This cannot be undone!')) return;
-      const names = await sceneStorage.getAllSceneNames();
-      await sceneStorage.clearAllScenes();
-      await populateScenesDropdown();
-      logSuccess(`Cleared ${names.length} custom scene(s)`);
-    });
-  }
-
-  log('Scene setup UI ready.');
+  clearPropsBtn?.addEventListener('click', () => {
+    if (confirm('Clear all props?')) {
+      propManager.clearAllProps();
+      pushSceneHistory('Cleared all props');
+    }
+  });
 }
-
-async function loadSceneSetup(sceneData) {
-  if (sceneData.environment?.hdr) {
-    loadScene(sceneData.environment.hdr, (_name, rawTexture) => {
-      const envMap = createHDREnvironment(rawTexture);
-      sceneManager.setEnvironment(envMap);
-      sceneManager.getScene().background = rawTexture;
-    });
-  }
-  if (sceneData.props) {
-    await propManager.loadSceneData(sceneData.props);
-  }
-
-  // Camera restore must happen AFTER loadModel finishes, because loadModel calls
-  // centerAndFrameModel() which resets the camera. Calling it here first would
-  // get overwritten. Instead we use a helper and call it inside the onLoaded callback.
-  function restoreCamera() {
-    if (!sceneData.camera) return;
-    cameraManager.getCamera().position.set(
-      sceneData.camera.position.x,
-      sceneData.camera.position.y,
-      sceneData.camera.position.z
-    );
-    const orbitControls = cameraManager.getControls();
-    orbitControls.target.set(
-      sceneData.camera.target.x,
-      sceneData.camera.target.y,
-      sceneData.camera.target.z
-    );
-    orbitControls.update();
-  }
-
-  if (sceneData.model?.name) {
-    // Sync the model dropdown so the UI reflects the saved model
-    const modelSel = document.getElementById('object-select') || document.getElementById('model-select');
-    if (modelSel) modelSel.value = sceneData.model.name;
-
-    // Load the saved model; once it finishes, restore transform then camera
-    // (camera must come after centerAndFrameModel so it isn't overwritten)
-    loadModel(sceneData.model.name, () => {
-      if (activeModel) {
-        const m = sceneData.model;
-        activeModel.position.set(m.position.x, m.position.y, m.position.z);
-        activeModel.rotation.set(m.rotation.x, m.rotation.y, m.rotation.z);
-        activeModel.scale.set(m.scale.x, m.scale.y, m.scale.z);
-      }
-      restoreCamera();
-    });
-  } else if (sceneData.model && activeModel) {
-    // Legacy saves (no model name stored) — just restore transform on current model
-    const m = sceneData.model;
-    activeModel.position.set(m.position.x, m.position.y, m.position.z);
-    activeModel.rotation.set(m.rotation.x, m.rotation.y, m.rotation.z);
-    activeModel.scale.set(m.scale.x, m.scale.y, m.scale.z);
-    restoreCamera();
-  } else {
-    restoreCamera();
-  }
-}
-
-//═══════════════════════════════════════════════════════════════
-// TRANSFORM TOOLBAR (viewport top-left)
-//═══════════════════════════════════════════════════════════════
 
 function setupTransformToolbar() {
   const btnTranslate = document.getElementById('tf-translate');
   const btnRotate    = document.getElementById('tf-rotate');
   const btnScale     = document.getElementById('tf-scale');
   const btnSnap      = document.getElementById('tf-snap');
-
-  const modeBtns = [btnTranslate, btnRotate, btnScale];
+  const modeBtns     = [btnTranslate, btnRotate, btnScale];
 
   function activateMode(mode, btn) {
     modeBtns.forEach(b => b?.classList.remove('tf-btn--active'));
@@ -1145,51 +1588,295 @@ function setupTransformToolbar() {
   btnRotate?.addEventListener('click',    () => activateMode('rotate',    btnRotate));
   btnScale?.addEventListener('click',     () => activateMode('scale',     btnScale));
 
-  // Snap toggle
   let snapOn = false;
   btnSnap?.addEventListener('click', () => {
     snapOn = !snapOn;
     propManager.setSnapEnabled(snapOn);
     btnSnap.classList.toggle('tf-btn--active', snapOn);
-    log(`Snap: ${snapOn ? 'on' : 'off'}`);
   });
 
-  // Keep toolbar in sync with keyboard shortcuts (G / R / S)
+  // Keep toolbar in sync with keyboard shortcuts (PropManager handles the actual mode change)
   window.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
     switch (e.key.toLowerCase()) {
-      case 'g': activateMode('translate', btnTranslate); break;
-      case 'r': activateMode('rotate',    btnRotate);    break;
+      case 'g': modeBtns.forEach(b => b?.classList.remove('tf-btn--active')); btnTranslate?.classList.add('tf-btn--active'); break;
+      case 'r': modeBtns.forEach(b => b?.classList.remove('tf-btn--active')); btnRotate?.classList.add('tf-btn--active');    break;
       case 's':
-        if (!e.ctrlKey && !e.metaKey) activateMode('scale', btnScale);
+        if (!e.ctrlKey && !e.metaKey) { modeBtns.forEach(b => b?.classList.remove('tf-btn--active')); btnScale?.classList.add('tf-btn--active'); }
         break;
     }
   });
 }
 
+//═══════════════════════════════════════════════════════════════
+// CUSTOM SCENES UI
+//═══════════════════════════════════════════════════════════════
+
+// loadSceneSetup — restores a full saved scene (env, props, model+transform, camera)
+// Camera is restored INSIDE the model onLoaded callback so it runs after centerAndFrameModel.
+async function loadSceneSetup(sceneData) {
+  // 1. Restore environment
+  if (sceneData.environment?.hdr) {
+    const sel = document.getElementById('environment-select');
+    if (sel) sel.value = sceneData.environment.hdr;
+    loadScene(sceneData.environment.hdr, (name, texture) => {
+      currentEnvTexture = texture;
+      currentEnvironment = name;
+      sceneManager.setEnvironment(texture);
+      applyBackground();
+      log(`Scene: ${name}`);
+    });
+  }
+
+  // 2. Restore props
+  if (sceneData.props) {
+    await propManager.loadSceneData(sceneData.props);
+  }
+
+  // 3. Camera restore — must run AFTER centerAndFrameModel inside onLoaded
+  function restoreCameraFromScene() {
+    if (!sceneData.camera) return;
+    const cam      = cameraManager.getCamera();
+    const orbit    = cameraManager.getControls();
+    cam.position.set(sceneData.camera.position.x, sceneData.camera.position.y, sceneData.camera.position.z);
+    orbit.target.set(sceneData.camera.target.x, sceneData.camera.target.y, sceneData.camera.target.z);
+    orbit.update();
+  }
+
+  // 4. Restore model + transform + camera
+  if (sceneData.model?.name) {
+    const sel = document.getElementById('object-select') || document.getElementById('model-select');
+    if (sel) sel.value = sceneData.model.name;
+    await loadModel(sceneData.model.name, () => {
+      if (activeModel) {
+        const m = sceneData.model;
+        activeModel.position.set(m.position.x, m.position.y, m.position.z);
+        activeModel.rotation.set(m.rotation.x, m.rotation.y, m.rotation.z);
+        activeModel.scale.set(m.scale.x, m.scale.y, m.scale.z);
+      }
+      restoreCameraFromScene();
+    });
+  } else {
+    restoreCameraFromScene();
+  }
+}
+
+async function resetScene() {
+  propManager.clearAllProps();
+
+  cleanupActiveModel();
+  if (STANDARD_OBJECTS.length > 0) {
+    const defaultLabel = STANDARD_OBJECTS[0].label;
+    const sel = document.getElementById('object-select');
+    if (sel) sel.value = defaultLabel;
+    loadModel(defaultLabel);
+  }
+
+  const defaultEnv = STANDARD_ENVIRONMENTS[0];
+  if (defaultEnv) {
+    const envSel = document.getElementById('environment-select');
+    if (envSel) envSel.value = defaultEnv.label;
+    loadScene(defaultEnv.label, (name, texture) => {
+      currentEnvTexture = texture;
+      currentEnvironment = name;
+      sceneManager.setEnvironment(texture);
+      applyBackground();
+    });
+  }
+
+  showEnvBackground = true;
+  gradientBgEnabled = false;
+  currentGradientBg = '';
+  const envBgToggle  = document.getElementById('env-bg-toggle');
+  const gradBgToggle = document.getElementById('gradient-bg-toggle');
+  const bgSelect     = document.getElementById('background-select');
+  if (envBgToggle)  envBgToggle.checked  = true;
+  if (gradBgToggle) gradBgToggle.checked = false;
+  if (bgSelect)     bgSelect.value = '';
+  applyBackground();
+
+  cameraManager.reset();
+  log('Scene reset to defaults.');
+}
+
+async function setupSceneSetupUI() {
+  const sceneSelect    = document.getElementById('scene-select');
+  const saveSceneBtn   = document.getElementById('save-scene-btn');
+  const exportSceneBtn = document.getElementById('export-scene-btn');
+  const importSceneBtn = document.getElementById('import-scene-btn');
+  const sceneFileInput = document.getElementById('scene-file-input');
+  const clearScenesBtn = document.getElementById('clear-scenes-btn');
+  const resetSceneBtn  = document.getElementById('reset-scene-btn');
+
+  if (!sceneSelect) return;
+
+  async function populateScenesDropdown() {
+    sceneSelect.innerHTML = '<option value="" disabled selected>--- Select a Scene ---</option>';
+    const names = await sceneStorage.getAllSceneNames();
+    if (names.length > 0) {
+      const grp = document.createElement('optgroup');
+      grp.label = 'Custom Scenes';
+      names.forEach(name => {
+        const opt = document.createElement('option');
+        opt.value = `custom:${name}`;
+        opt.textContent = name;
+        grp.appendChild(opt);
+      });
+      sceneSelect.appendChild(grp);
+    }
+  }
+
+  await populateScenesDropdown();
+
+  sceneSelect.addEventListener('change', async (e) => {
+    const value = e.target.value;
+    if (!value.startsWith('custom:')) return;
+    const sceneData = await sceneStorage.getScene(value.replace('custom:', ''));
+    if (sceneData) await loadSceneSetup(sceneData);
+  });
+
+  saveSceneBtn?.addEventListener('click', async () => {
+    const name = prompt('Enter scene name:');
+    if (!name?.trim()) return;
+    const cam    = cameraManager.getCamera();
+    const orbit  = cameraManager.getControls();
+    await sceneStorage.saveScene(name.trim(), {
+      environment: { hdr: currentEnvironment, background: currentGradientBg || null },
+      props:  propManager.getSceneData(),
+      camera: {
+        position: { x: cam.position.x,  y: cam.position.y,  z: cam.position.z },
+        target:   { x: orbit.target.x,  y: orbit.target.y,  z: orbit.target.z }
+      },
+      model: activeModel ? {
+        name:     getCurrentModelName(),
+        position: { x: activeModel.position.x, y: activeModel.position.y, z: activeModel.position.z },
+        rotation: { x: activeModel.rotation.x, y: activeModel.rotation.y, z: activeModel.rotation.z },
+        scale:    { x: activeModel.scale.x,    y: activeModel.scale.y,    z: activeModel.scale.z }
+      } : null
+    });
+    await populateScenesDropdown();
+    log(`Scene saved: ${name.trim()}`);
+  });
+
+  exportSceneBtn?.addEventListener('click', async () => {
+    const value = sceneSelect?.value;
+    if (!value?.startsWith('custom:')) { log('Select a scene to export'); return; }
+    await sceneStorage.exportScene(value.replace('custom:', ''));
+  });
+
+  importSceneBtn?.addEventListener('click', () => sceneFileInput?.click());
+  sceneFileInput?.addEventListener('change', async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const result = await sceneStorage.importScene(file);
+      if (result.success) {
+        await populateScenesDropdown();
+        log(`Scene imported: ${result.name}`);
+      }
+    } catch (err) { logError(`Scene import failed: ${err.message}`); }
+    sceneFileInput.value = '';
+  });
+
+  clearScenesBtn?.addEventListener('click', async () => {
+    if (!confirm('Delete all custom scenes? This cannot be undone!')) return;
+    await sceneStorage.clearAllScenes();
+    await populateScenesDropdown();
+    log('All custom scenes deleted');
+  });
+
+  resetSceneBtn?.addEventListener('click', async () => {
+    if (!confirm('Reset scene to defaults? This will remove all props and reload the default model.')) return;
+    await resetScene();
+  });
+}
+
+//═══════════════════════════════════════════════════════════════
+// ANIMATION LOOP
+//═══════════════════════════════════════════════════════════════
+
+// Demand rendering — only render when something changed.
+// markNeedsRender(frames) schedules N frames of rendering (default 4).
+// Camera movement/damping also triggers continuous rendering while active.
+let _renderBurst = 4;
+function markNeedsRender(frames = 4) {
+  if (frames > _renderBurst) _renderBurst = frames;
+}
+window.markNeedsRender = markNeedsRender; // expose for UVEditor + other modules
+
+// Any slider or dropdown change triggers a render burst (covers all material/bg/env changes)
+document.addEventListener('input',  () => markNeedsRender(4), { passive: true, capture: true });
+document.addEventListener('change', () => markNeedsRender(4), { passive: true, capture: true });
+
 function animate() {
   requestAnimationFrame(animate);
-  cameraManager.update();
-  propManager.updateOutlines();
-  rendererManager.render(sceneManager.getScene(), cameraManager.getCamera());
+  const cameraMoved = cameraManager.update(); // true while camera is moving/damping
+  if (cameraMoved && _renderBurst < 4) _renderBurst = 4;
+
+  if (_renderBurst > 0) {
+    if (propManager.hasOutlines()) propManager.updateOutlines();
+    rendererManager.render(sceneManager.getScene(), cameraManager.getCamera());
+    _renderBurst--;
+  }
 }
 animate();
 
-updateModelList();
-updateSceneList();
-updateMaterialPresetList();
-setupCameraUI();
-setupPostFXUI();
-setupPreviewQualityUI();
-setupPropsUI();
-setupSceneSetupUI();
-setupTransformToolbar();
+//═══════════════════════════════════════════════════════════════
+// INITIAL SETUP
+//═══════════════════════════════════════════════════════════════
 
-rendererManager.getRenderer().toneMapping = THREE.ACESFilmicToneMapping;
-rendererManager.getRenderer().toneMappingExposure = 1.0;
+async function initializeApp() {
+  // Fast path: preload last edited model immediately (sync localStorage read).
+  try {
+    const raw = localStorage.getItem(SESSION_BOOT_KEY);
+    if (raw) {
+      const boot = JSON.parse(raw);
+      const bootName = boot?.modelName;
+      if (bootName) {
+        const modelSel = document.getElementById('object-select') || document.getElementById('model-select');
+        if (modelSel) modelSel.value = bootName;
+        loadModel(bootName);
+      }
+    }
+  } catch (_) {
+    // ignore malformed/blocked localStorage
+  }
 
-const firstModel = Object.keys(MODEL_PATHS).find(k => k !== 'BASE_PATH');
-if (firstModel) {
-  const name = firstModel.split('_').map(w => w.charAt(0) + w.slice(1).toLowerCase()).join(' ');
-  setTimeout(() => loadModel(name), 100);
+  await updateModelList();
+  updateSceneList();
+  updateMaterialPresetList();
+  setupCameraUI();
+  setupPostFXUI();
+  setupPreviewQualityUI();
+  setupBackgroundUI();
+  setupDesignShortcuts();
+  setupPropsUI();
+  setupTransformToolbar();
+  await setupSceneSetupUI();
+  setupHistoryUI();
+
+  // Apply initial renderer tone mapping
+  rendererManager.getRenderer().toneMapping = THREE.ACESFilmicToneMapping;
+  rendererManager.getRenderer().toneMappingExposure = 1.0;
+
+  const restored = await restoreSessionState();
+  if (!restored && STANDARD_OBJECTS.length > 0) {
+    setTimeout(() => loadModel(STANDARD_OBJECTS[0].label), 100);
+  }
+
+  // Record initial history states after everything is loaded
+  setTimeout(() => {
+    designState.init('Initial state');
+    materialState.init('Initial state');
+    sceneState.init('Initial state');
+  }, 500);
 }
+
+window.addEventListener('beforeunload', saveSessionState);
+window.addEventListener('pagehide', saveSessionState);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') saveSessionState();
+});
+
+initializeApp();
+//

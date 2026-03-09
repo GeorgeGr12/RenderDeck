@@ -15,7 +15,7 @@ export class PropManager {
     this.renderer = renderer;
     this.orbitControls = orbitControls;
     this.log = log || console.log;
-    
+
     this.gltfLoader = new GLTFLoader();
     this.props = [];
     this.nextPropId = 1;
@@ -29,7 +29,8 @@ export class PropManager {
     this.customProps = new Map();
     this.mainModel = null;
     this._mainModelHelper = null;
-    
+    this.onTransformCommit = null; // set by caller; receives (mode: 'translate'|'rotate'|'scale')
+
     this._setupTransformControls();
     this._setupEventListeners();
   }
@@ -42,7 +43,7 @@ export class PropManager {
     // getHelper() returns the visual root that must be added to the scene.
     this._tcHelper = this.transformControls.getHelper();
     this.scene.add(this._tcHelper);
-    
+
     this._gizmoWasActive = false;
 
     this.transformControls.addEventListener('dragging-changed', (event) => {
@@ -54,13 +55,15 @@ export class PropManager {
       if (!event.value) {
         this._gizmoWasActive = true;
         requestAnimationFrame(() => { this._gizmoWasActive = false; });
+        this.onTransformCommit?.(this.transformMode);
       }
     });
-    
+
     this.transformControls.addEventListener('objectChange', () => {
       if (this.selectedProp) {
         this._updatePropTransform(this.selectedProp);
       }
+      window.markNeedsRender?.(4);
     });
   }
 
@@ -72,13 +75,13 @@ export class PropManager {
   _onCanvasClick(event) {
     if (this.transformControls.dragging) return;
     if (this._gizmoWasActive) return;
-    
+
     const rect = this.renderer.domElement.getBoundingClientRect();
     this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-    
+
     this.raycaster.setFromCamera(this.mouse, this.camera);
-    
+
     const propObjects = this.props.map(p => p.object3D).filter(Boolean);
     const allMeshes = [];
     propObjects.forEach(obj => {
@@ -86,7 +89,7 @@ export class PropManager {
         if (child.isMesh) allMeshes.push(child);
       });
     });
-    
+
     const intersects = this.raycaster.intersectObjects(allMeshes, false);
 
     if (intersects.length > 0) {
@@ -126,7 +129,7 @@ export class PropManager {
 
   _onKeyDown(event) {
     if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') return;
-    
+
     switch (event.key.toLowerCase()) {
       case 'g':
         this.setTransformMode('translate');
@@ -155,7 +158,7 @@ export class PropManager {
 
   getAvailableProps() {
     const props = [];
-    
+
     Object.entries(PROP_PATHS).forEach(([key, cfg]) => {
       if (key !== 'BASE_PATH' && cfg.file) {
         props.push({
@@ -166,17 +169,17 @@ export class PropManager {
         });
       }
     });
-    
+
     this.customProps.forEach((_url, name) => {
       props.push({ id: `custom_${name}`, name, category: 'Custom', type: 'custom' });
     });
-    
+
     return props;
   }
 
   async addProp(propId, position = { x: 0, y: 0, z: 0 }) {
     let url, displayName;
-    
+
     if (propId.startsWith('custom_')) {
       const name = propId.replace('custom_', '');
       url = this.customProps.get(name);
@@ -194,9 +197,9 @@ export class PropManager {
       url = PROP_PATHS.BASE_PATH + cfg.file;
       displayName = cfg.displayName || propId;
     }
-    
+
     this.log(`Loading prop: ${displayName}...`);
-    
+
     return new Promise((resolve, reject) => {
       this.gltfLoader.load(
         url,
@@ -234,7 +237,7 @@ export class PropManager {
           // Update world matrix so TransformControls positions the gizmo correctly
           object.updateMatrixWorld(true);
           this.selectProp(prop.id);
-          
+
           this.log(`Prop added: ${displayName}`);
           this._updatePropsList();
           resolve(prop);
@@ -251,10 +254,10 @@ export class PropManager {
   removeProp(propId) {
     const index = this.props.findIndex(p => p.id === propId);
     if (index === -1) return;
-    
+
     const prop = this.props[index];
     if (this.selectedProp?.id === propId) this.deselectProp();
-    
+
     this.scene.remove(prop.object3D);
     prop.object3D.traverse(child => {
       if (child.isMesh) {
@@ -266,7 +269,7 @@ export class PropManager {
         }
       }
     });
-    
+
     this.props.splice(index, 1);
     this.log(`Prop removed: ${prop.displayName}`);
     this._updatePropsList();
@@ -275,13 +278,13 @@ export class PropManager {
   async duplicateProp(propId) {
     const prop = this.props.find(p => p.id === propId);
     if (!prop) return;
-    
+
     const newPosition = {
       x: prop.position.x + 0.5,
       y: prop.position.y,
       z: prop.position.z + 0.5
     };
-    
+
     const newProp = await this.addProp(prop.type, newPosition);
     if (newProp) {
       newProp.object3D.rotation.set(
@@ -393,6 +396,11 @@ export class PropManager {
     outline.material?.dispose();
   }
 
+  /** Returns true if there are any active outlines (used to skip updateOutlines when idle) */
+  hasOutlines() {
+    return !!(this.selectedProp?._outlineHelper || this._mainModelHelper);
+  }
+
   /** Call every frame from the animate loop to keep outlines tracking moving objects */
   updateOutlines() {
     const { dw, dh, linewidth } = this._outlineMetrics();
@@ -439,7 +447,7 @@ export class PropManager {
     prop.scale.x = prop.object3D.scale.x;
     prop.scale.y = prop.object3D.scale.y;
     prop.scale.z = prop.object3D.scale.z;
-    
+
     if (this.collisionEnabled) this._checkCollisions(prop);
     this._updatePropsList();
   }
@@ -501,26 +509,26 @@ export class PropManager {
   _updatePropsList() {
     const list = document.getElementById('props-list');
     if (!list) return;
-    
+
     list.innerHTML = '';
     if (this.props.length === 0) {
       list.innerHTML = '<p class="empty-message">No props added</p>';
       return;
     }
-    
+
     this.props.forEach(prop => {
       const item = document.createElement('div');
       item.className = 'prop-item' + (this.selectedProp?.id === prop.id ? ' selected' : '');
       item.dataset.propId = prop.id;
-      
+
       const name = document.createElement('span');
       name.className = 'prop-item-name';
       name.textContent = prop.displayName;
-      
+
       const coords = document.createElement('span');
       coords.className = 'prop-item-coords';
       coords.textContent = `(${prop.position.x.toFixed(1)}, ${prop.position.y.toFixed(1)}, ${prop.position.z.toFixed(1)})`;
-      
+
       item.appendChild(name);
       item.appendChild(coords);
       item.addEventListener('click', () => this.selectProp(prop.id));
@@ -537,6 +545,30 @@ export class PropManager {
     }));
   }
 
+  getMainModelTransform() {
+    if (!this.mainModel) return null;
+    const p = this.mainModel.position;
+    const r = this.mainModel.rotation;
+    const s = this.mainModel.scale;
+    return {
+      position: { x: p.x, y: p.y, z: p.z },
+      rotation: { x: THREE.MathUtils.radToDeg(r.x), y: THREE.MathUtils.radToDeg(r.y), z: THREE.MathUtils.radToDeg(r.z) },
+      scale:    { x: s.x, y: s.y, z: s.z },
+    };
+  }
+
+  applyMainModelTransform(data) {
+    if (!this.mainModel || !data) return;
+    this.mainModel.position.set(data.position.x, data.position.y, data.position.z);
+    this.mainModel.rotation.set(
+      THREE.MathUtils.degToRad(data.rotation.x),
+      THREE.MathUtils.degToRad(data.rotation.y),
+      THREE.MathUtils.degToRad(data.rotation.z)
+    );
+    this.mainModel.scale.set(data.scale.x, data.scale.y, data.scale.z);
+    this.mainModel.updateMatrixWorld(true);
+  }
+
   async loadSceneData(propsData) {
     this.clearAllProps();
     for (const data of propsData) {
@@ -549,6 +581,7 @@ export class PropManager {
         );
         prop.object3D.scale.set(data.scale.x, data.scale.y, data.scale.z);
         this._updatePropTransform(prop);
+        window.markNeedsRender?.(4);
       }
     }
     this.deselectProp();
